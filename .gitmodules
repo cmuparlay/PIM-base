@@ -8,3 +8,6 @@
 [submodule "upmem-sdk"]
 	path = upmem-sdk
 	url = https://github.com/Loremkang/upmem-sdk
+[submodule "argparse"]
+	path = argparse
+	url = https://github.com/p-ranav/argparse
