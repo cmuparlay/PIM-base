@@ -1,0 +1,33 @@
+#pragma once
+#include "macro_common.h"
+#include "common.h"
+
+// flags
+#define DPU_BUFFER_ERROR (-1)
+#define DPU_BUFFER_SUCCEED (0)
+
+#define DPU_BLOCK_FIXLEN (0)
+#define DPU_BLOCK_VARLEN (1)
+
+// constants
+#define MAX_IO_BLOCKS (10)
+
+// cpu-dpu protocol
+#define CPU_DPU_HEADER_I64 (3)
+#define CPU_DPU_HEADER ((int)S64(CPU_DPU_HEADER_I64))
+
+#define CPU_DPU_BLOCK_HEADER_I64 (3)
+#define CPU_DPU_BLOCK_HEADER ((int)S64(CPU_DPU_BLOCK_HEADER_I64))
+
+#define DPU_CPU_HEADER_I64 (3)
+#define DPU_CPU_HEADER ((int)S64(DPU_CPU_HEADER_I64))
+
+#define DPU_CPU_BLOCK_HEADER_I64 (3)
+#define DPU_CPU_BLOCK_HEADER ((int)S64(DPU_CPU_BLOCK_HEADER_I64))
+
+// offsets & lengths
+#define DPU_SEND_BUFFER_OFFSET (MAX_TASK_BUFFER_SIZE_PER_DPU)
+#define MAX_TASK_BUFFER_SIZE_PER_TASKLET (MAX_TASK_BUFFER_SIZE_PER_DPU / NR_TASKLETS)
+#define MAX_TASK_COUNT_PER_TASKLET_PER_BLOCK (MAX_TASK_COUNT_PER_DPU_PER_BLOCK / NR_TASKLETS)
+
+#define DPU_MRAM_HEAP_START_SAFE_BUFFER (40 << 5)
