@@ -1,3 +1,10 @@
 [submodule "timer_tree"]
 	path = timer_tree
 	url = https://github.com/Loremkang/timer_tree
+[submodule "parlaylib"]
+	path = parlaylib
+	url = https://github.com/Loremkang/parlaylib
+	branch = for_pim_tree
+[submodule "upmem-sdk"]
+	path = upmem-sdk
+	url = https://github.com/Loremkang/upmem-sdk
