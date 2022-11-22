@@ -4,7 +4,7 @@ This submodule contains efficient low-level function calls we implemented, inclu
 
 If you use our codes, please cite our paper:
 
-[1] **PIM-tree: A Skew-resistant Index for Processing-in-Memory.** Hongbo Kang, Yiwei Zhao, Guy E. Blelloch, Laxman Dhulipala, Yan Gu, Charles McGuffey, Phillip B. Gibbons. 2022. *arxiv Preprint*.
+[1] **PIM-tree: A Skew-resistant Index for Processing-in-Memory.** Hongbo Kang, Yiwei Zhao, Guy E. Blelloch, Laxman Dhulipala, Yan Gu, Charles McGuffey, Phillip B. Gibbons. 2022. *arxiv Preprint: 2211.10516*. [[arxiv](https://arxiv.org/abs/2211.10516)].
 
 [2] **The Processing-in-Memory Model.** Hongbo Kang, Phillip B Gibbons, Guy E Blelloch, Laxman Dhulipala, Yan Gu, Charles McGuffey. 2021. In Proceedings of the 33rd ACM Symposium on Parallelism in Algorithms and Architectures. 295–306. [[doi](https://dl.acm.org/doi/10.1145/3409964.3461816)].
 
