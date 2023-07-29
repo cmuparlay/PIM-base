@@ -69,8 +69,6 @@ class batch_parallel_oracle {
     parlay::sequence<key_value> predecessor_batch(
         const parlay::slice<i64iterator, i64iterator>& buf) {
         int length = buf.size();
-        // using TT = decltype(buf[0]);
-        // using X = typename TT::nothing;
         static_assert(
             std::is_same<typename std::int64_t&, decltype(buf[0])>::value);
         return parlay::tabulate(length,
@@ -80,8 +78,6 @@ class batch_parallel_oracle {
     template <typename i64iterator>
     auto predecessor_position_batch(
         const parlay::slice<i64iterator, i64iterator>& buf) {
-        // static_assert(
-        //     std::is_same<typename std::int64_t, decltype(buf[0])>::value);
         int length = buf.size();
         return parlay::tabulate(
             length, [&](size_t i) { return predecessor_position(buf[i]); });
@@ -89,8 +85,6 @@ class batch_parallel_oracle {
 
     template <typename kviterator>
     void insert_batch(const parlay::slice<kviterator, kviterator>& buffer) {
-        // static_assert(
-        //     std::is_same<typename key_value, decltype(buffer[0])>::value);
         auto buffer_sorted = parlay::sort(buffer);
 
         auto buf =
@@ -151,7 +145,7 @@ class batch_parallel_oracle {
         }
         int64_t rr = r, mm = mid;
         r = mid;
-        while (r - l > 1) {
+        while (r - l > 10) {
             mid = (l + r) >> 1;
             if (s[mid].key > lkey) {
                 r = mid;
@@ -159,8 +153,10 @@ class batch_parallel_oracle {
                 l = mid;
             }
         }
-        if (lkey > s[l].key) l++;
-        while (rr - mm > 1) {
+        for(; l < r; l++)
+            if(s[l].key >= lkey)
+                break;
+        while (rr - mm > 10) {
             mid = (rr + mm) >> 1;
             if (s[mid].key > rkey) {
                 rr = mid;
@@ -168,18 +164,9 @@ class batch_parallel_oracle {
                 mm = mid;
             }
         }
-        if (mm >= s.size() - 1)
-            mm = s.size();
-        else if (s[mm + 1].key <= rkey)
-            mm += 2;
-        else
-            mm++;
-        if(l == mm || l + 1 == mm) {
-            if(s[l].key >= lkey && s[l].key <= rkey)
-                mm = l + 1;
-            else
-                mm = l;
-        }
+        for(; mm < rr; mm++)
+            if(s[mm].key > rkey)
+                break;
         return std::make_pair(l, mm);
     }
 

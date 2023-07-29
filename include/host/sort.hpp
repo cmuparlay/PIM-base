@@ -16,6 +16,7 @@ void fill_task_to_buffer(InSeq In, KeySeq Keys, OffsetIterator offsets, size_t n
   for (size_t j = 0; j < In.size(); j++) {
     LocationType k = local_offsets[Keys[j]]++;
     auto ptr = &(buffers[Keys[j]][k]);
+    // needs to be made portable
     // #if defined(__GNUC__) || defined(__clang__)
     //    __builtin_prefetch (((char*) ptr) + 64);
     // #endif
@@ -47,6 +48,9 @@ void inner_sort_task(slice<TaskIterator, TaskIterator> In, Id id,
 
         size_t num_blocks =
             1 + n * sizeof(T) / std::max<size_t>(num_buckets * 500, 5000);
+        if (num_buckets > 2500) {
+            num_blocks = max(num_blocks, parlay::num_workers());
+        }
         size_t block_size = ((n - 1) / num_blocks) + 1;
 
         auto Keys = id;
@@ -129,6 +133,12 @@ std::pair<sequence<size_t>, bool> count_sort_task(
 
     // pick number of blocks for sufficient parallelism but to make sure
     // cost on counts is not to high (i.e. bucket upper).
+    // size_t par_lower = 1 + static_cast<size_t>(round(num_threads *
+    // parallelism * 9)); size_t size_lower = 1;  // + n * sizeof(T) / 2000000;
+    // size_t bucket_upper =
+    //     1 + n * sizeof(T) / (4 * num_buckets * sizeof(s_size_t));
+    // size_t num_blocks = (std::min)(bucket_upper, (std::max)(par_lower,
+    // size_lower));
     size_t num_blocks =
         1 + n * sizeof(T) / std::max<size_t>(num_buckets * 500, 5000);
 

@@ -49,6 +49,7 @@ void zipf_over_items(double a, slice<int*, int*> ids, int P, int ds_size) {
     }
 
     auto slice_id = parlay::tabulate(ids.size(), [&](size_t i) {
+        (void)i;
         double rd = (double)(abs(rn_gen::parallel_rand())) / (double)INT64_MAX;
         int l = -1, r = P - 1;  // (]
         while (r - l > 1) {
@@ -59,7 +60,6 @@ void zipf_over_items(double a, slice<int*, int*> ids, int P, int ds_size) {
                 r = mid;
             }
         }
-        int position = r;
         return order[r];
     });
 
@@ -91,6 +91,7 @@ void zipf_over_keys(double a, slice<int64_t*, int64_t*> keys, int P) {
     }
 
     auto slice_id = parlay::tabulate(keys.size(), [&](size_t i) {
+        (void)i;
         double rd = (double)(abs(rn_gen::parallel_rand())) / (double)INT64_MAX;
         int l = -1, r = P - 1;  // (]
         while (r - l > 1) {
@@ -101,7 +102,6 @@ void zipf_over_keys(double a, slice<int64_t*, int64_t*> keys, int P) {
                 r = mid;
             }
         }
-        int position = r;
         return order[r];
     });
 
@@ -239,6 +239,7 @@ class test_generator {
     void fill_with_search_ops(slice<operation*, operation*> ops, bool zipf,
                               double alpha, int bias,
                               batch_parallel_oracle& oracle, int batch_size) {
+        (void)oracle;
         int n = ops.size();
         assert((n % batch_size) == 0);
         auto ids = parlay::sequence<int64_t>(batch_size);
@@ -262,6 +263,7 @@ class test_generator {
     void fill_with_insert_ops(slice<operation*, operation*> ops, bool zipf,
                               double alpha, int bias,
                               batch_parallel_oracle& oracle, int batch_size) {
+        (void)oracle;
         int n = ops.size();
         assert((n % batch_size) == 0);
         auto ids = parlay::sequence<int64_t>(batch_size);
@@ -332,8 +334,7 @@ class test_generator {
                 op.type = operation_t::scan_t;
                 op.tsk.s.lkey = ids[i];
                 op.tsk.s.rkey = ids[i] +
-                    (UINT64_MAX / oracle.inserted.size() * expected_length);
-                assert(expected_length == 100);
+                    (INT64_MAX / oracle.inserted.size() * 2 * expected_length);
                 sub_slice[i] = op;
             });
         }
@@ -343,20 +344,18 @@ class test_generator {
                               double alpha, int bias,
                               batch_parallel_oracle& oracle, int batch_size) {
         int n = ops.size();
+        // int m = keys.size();
         assert((n % batch_size) == 0);
         bool single_type = true;
         for (int t = 0; t < OPERATION_NR_ITEMS; t ++) {
-            if (possibilities[t] != 1.0 && possibilities[t] != 0.0) {
+            if (possibilities[t] != 0.0 && possibilities[t] != 0.0) {
                 single_type = false;
                 break;
             }
         }
-        printf("single type=%d\n", single_type);
-        if (single_type) { // micro benchmarks
-            double rd = (double)(abs(rn_gen::parallel_rand())) / (double)INT64_MAX;
+        if (single_type) {
             for (int t = 0; t < OPERATION_NR_ITEMS; t++) {
-                if (rd < possibilities[t]) {
-                // if (possibilities[t] == 1.0) {
+                if (possibilities[t] == 1.0) {
                     if (t == 1) {
                         fill_with_get_ops(ops, zipf, alpha, bias, oracle,
                                           batch_size);
@@ -383,7 +382,7 @@ class test_generator {
                     break;
                 }
             }
-        } else { // used only for debug
+        } else { // used for debug
             auto& kvs = oracle.inserted;
             int m = kvs.size();
             auto keys = parlay::delayed_seq<int64_t>(m, [&](size_t i) {

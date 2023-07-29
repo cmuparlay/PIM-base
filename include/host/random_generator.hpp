@@ -10,7 +10,7 @@ using namespace std;
 
 class rn_gen {
    public:
-    inline static vector<rn_gen> rand_gens;
+    static vector<rn_gen> rand_gens;
 
     static int64_t randint64_rand() {
         uint64_t v = rand();
@@ -26,7 +26,6 @@ class rn_gen {
     static void init() {
         srand(time(NULL));
         // srand(137);
-
         int thread_num = parlay::num_workers();
         cout<<"rand init: tn = " << thread_num << endl;
         for (int i = 0; i < thread_num; i++) {
@@ -35,17 +34,17 @@ class rn_gen {
     }
 
     static int64_t parallel_rand() {
-        int tid = parlay::worker_id();
+        thread_local int tid = parlay::worker_id();
         return rand_gens[tid].next();
     }
 
     rn_gen(size_t seed) : state(seed){};
     rn_gen() : state(0){};
     int64_t random(int64_t i) { return parlay::hash64(this->state + i); }
-    int64_t proceed(int64_t i) { this->state += i; }
     int64_t next() { return parlay::hash64(this->state++); }
 
    private:
     size_t state = 0;
-    
 };
+
+vector<rn_gen> rn_gen::rand_gens;

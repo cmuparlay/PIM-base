@@ -72,6 +72,7 @@ static inline void print_io_buffer(mpuint8_t buffer) {
     printf("\n***\n");
 }
 
+
 /* ---------------------------- IO Manager Init ---------------------------- */
 static inline void init_io_manager() {
     mpint64_t buf = (mpint64_t)recv_buffer;
@@ -303,16 +304,6 @@ static inline void finish_reply(int length, int tasklet_id) {
         finish_variable_reply(tasklet_id);
     }
 }
-
-// void print_io_buffer() {
-//     mpint64_t buf = (mpint64_t)send_buffer;
-//     TASK_IN_DPU_ASSERT((buf[2] % sizeof(int64_t)) == 0,
-//                   "finish io manager: error\n");
-//     for (int i = 0; i < buf[2] / sizeof(int64_t); i++) {
-//         printf("%llx\t", buf[i]);
-//     }
-//     printf("\n");
-// }
 
 static inline void finish_io_manager(int tasklet_id) {
     if (tasklet_id == 0) {

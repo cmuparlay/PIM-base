@@ -5,21 +5,14 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <string>
-#include <shared_mutex>
 #include "fcntl.h"
 #include "oracle.hpp"
 #include "operation_def.hpp"
 #include "timer.hpp"
 #include "test_generator.hpp"
 #include "operation.hpp"
-#include "parlay/papi/papi_util_impl.h"
-#include <unistd.h>
-#include <sys/stat.h>
-#include <filesystem>
-
 using namespace std;
 using namespace parlay;
-namespace fs = std::filesystem;
 
 void dpu_energy_stats(bool flag = false) {
     #ifdef DPU_ENERGY
@@ -169,48 +162,27 @@ auto read_op_file(string name, Checker checker) {
     return operations;
 }
 
-namespace core {
+class core {
+   public:
+    static batch_parallel_oracle oracle;
+    static bool check_result;
+    static int batch_number;
 
-batch_parallel_oracle oracle;
-bool check_result = true;
-atomic<int> batch_number = 0;
+    // core(bool cr) {
+    //     check_result = cr;
+    // }
 
-int num_top_level_threads;
-int num_wait_microsecond;
-int push_pull_limit_dynamic;
-
-shared_mutex op_mutex;
-
-void get(slice<get_operation*, get_operation*> ops, unique_lock<mutex>& mut, int tid = 0) {
-    parlay::sequence<int64_t> ops_sequence;
-    pim_skip_list* ds = &pim_skip_list_drivers[tid];
-    int n = ops.size();
-    {
-        if (check_result) {
-            ops_sequence =
-                parlay::tabulate(n, [&](size_t i) { return ops[i].key; });
-        }
+    static void get(slice<get_operation*, get_operation*> ops) {
+        cout << (batch_number++) << " " << __FUNCTION__ << endl;
         auto ops2 = make_slice((int64_t*)ops.begin(), (int64_t*)ops.end());
-        time_nested("get load", [&]() { ds->get_load(ops2); });
-        mut.unlock();
-    }
-
-    {
-        shared_lock rLock(op_mutex);
-        cout << (batch_number++) << " " << __FUNCTION__ << " " << tid << endl;
-        time_nested("get", [&]() {
-            ds->get();
-        });
+        time_start("get");
+        auto v1 = pim_skip_list::get(ops2);
+        time_end("get");
         if (check_result) {
-            auto v1 = parlay::make_slice(ds->kv_output, ds->kv_output + n);
-            auto pred = oracle.predecessor_batch(make_slice(ops_sequence));
-            auto v2 = parlay::tabulate(pred.size(), [&](size_t i) {
-                if (pred[i].key != ops_sequence[i]) {
-                    return (key_value){.key = INT64_MIN, .value = INT64_MIN};
-                } else {
-                    return pred[i];
-                }
-            });
+            auto oracle_kv = oracle.predecessor_batch(ops2);
+            auto v2 = oracle_kv;
+            // auto v2 = parlay::map(oracle_kv,
+            //                       [](const key_value& kv) { return kv.value; });
             if (!parlay::equal(v1, v2)) {
                 int n = v1.size();
                 for (int i = 0; i < n; i++) {
@@ -223,94 +195,77 @@ void get(slice<get_operation*, get_operation*> ops, unique_lock<mutex>& mut, int
             }
         }
     }
-}
 
-void update(slice<update_operation*, update_operation*> ops,
-            unique_lock<mutex>& mut, int tid = 0) {
-    assert(false);
-}
+    static void update(slice<update_operation*, update_operation*> ops) {
+        cout << (batch_number++) << " " << __FUNCTION__ << endl;
+        time_start("update");
+        auto ops2 = make_slice((key_value*)ops.begin(), (key_value*)ops.end());
+        time_end("update");
+        pim_skip_list::update(ops2);
+        if (check_result) {
+            oracle.insert_batch(ops2);
+        }
+    }
 
-// Range Scan
-void scan(slice<scan_operation*, scan_operation*> ops, unique_lock<mutex>& mut, int tid = 0,
-          bool reset_len=false, int64_t expected_length = 100, uint64_t dataset_size=500000000) {
-    pim_skip_list* ds = &pim_skip_list_drivers[tid];
-    if(reset_len) {
-        int64_t range_size;
-        if(check_result)
-            range_size = UINT64_MAX / oracle.inserted.size() * expected_length;
-        else
-            range_size = UINT64_MAX / dataset_size * expected_length;
-        parfor_wrap(0, ops.size(), [&](size_t i) {
-            if (ops[i].lkey < INT64_MAX - range_size)
+    // Range Scan
+    static void scan(slice<scan_operation*, scan_operation*> ops, int64_t expected_length = 100) {
+        cout << (batch_number++) << " " << __FUNCTION__ << " " << ops.size() << endl;
+        int64_t range_size = INT64_MAX / oracle.inserted.size() * 2 * expected_length;
+        parfor_wrap(0, ops.size(), [&](size_t i){
+            if(ops[i].lkey < INT64_MAX - range_size)
                 ops[i].rkey = ops[i].lkey + range_size;
         });
-    }
-    parfor_wrap(0, ops.size(), [&](size_t i) {
-        if (ops[i].lkey >= ops[i].rkey)
-            ops[i].rkey = ops[i].lkey + 1;
-    });
-    // slice<scan_operation*, scan_operation*> ops2 = ops;
-    mut.unlock();
-    shared_lock rLock(op_mutex);
-    cout << (batch_number++) << " " << __FUNCTION__ << " " << tid << endl;
-    time_start("scan");
-    auto v1 = ds->scan(ops);
-    time_end("scan");
-    if (check_result) {
-        int64_t length = ops.size();
-        auto v2 = oracle.scan_size_batch(ops);
-        bool correct = true;
-        parlay::parallel_for(0, length, [&](size_t i) {
-            if (correct) {
-                if ((v2[i].second - v2[i].first) !=
-                    (v1.second[i].second - v1.second[i].first)) {
-                    correct = false;
-                }
-            }
-        });
-        if (!correct) {
-            int64_t v1l, v2l, res = 0, print_num = 0;
-            for (int64_t i = 0; i < length; i++) {
-                v1l = v1.second[i].second - v1.second[i].first;
-                v2l = v2[i].second - v2[i].first;
-                if (v2l != v1l) {
-                    if(print_num < 10){
-                        printf("k=(%lld,%lld) v1_s=%lld v2_s=%lld\n",
-                            ops[i].lkey, ops[i].rkey, v1l, v2l);
-                        print_num++;
+        int64_t max_batch_size = BATCH_SIZE / 2 / expected_length;
+        slice<scan_operation*, scan_operation*> ops2 = ops;
+        parlay::sequence<scan_operation> ops_tmp;
+        if(check_result && ops.size() > max_batch_size){
+            ops_tmp = parlay::tabulate(max_batch_size, [&](size_t i){return ops[i];});
+            ops2 = parlay::make_slice(ops_tmp);
+            cout<<"Batch size -> "<<max_batch_size<<" to avoid overflow."<<endl;
+        }
+        time_start("scan");
+        auto v1 = pim_skip_list::scan(ops2);
+        time_end("scan");
+        int64_t length = ops2.size();
+        if(check_result) {
+            auto v2 = oracle.scan_size_batch(ops2);
+            bool correct = true;
+            parlay::parallel_for(0, length, [&](size_t i){
+                if(correct) {
+                    int64_t v1l = (v1.second[i].second - v1.second[i].first);
+                    int64_t v2l = (v2[i].second - v2[i].first);
+                    if(v1l - v2l > 1 || v2l - v1l > 1) {
+                        correct = false;
                     }
-                    res++;
                 }
+            });
+            if(!correct) {
+                int64_t v1l, v2l, res = 0;
+                for(int64_t i = 0; i < length; i++) {
+                    v1l = v1.second[i].second - v1.second[i].first;
+                    v2l = v2[i].second - v2[i].first;
+                    if(v1l - v2l > 1 || v2l - v1l > 1) {
+                        if(res < 20)
+                            printf("k=(%lld,%lld) v1_s=%lld v2_s=%lld i=%lld\n",
+                                ops2[i].lkey, ops2[i].rkey, v1l, v2l, i);
+                        res++;
+                    }
+                }
+                cout<<"Number of Errorness: "<<res<<endl;
+                cout<<"kv_set size returned: "<<v1.first.size()<<endl;
             }
-            cout << "Number of Errorness: " << res << endl;
-            cout << "kv_set size returned: " << v1.first.size() << endl;
         }
     }
-}
 
-void predecessor(slice<predecessor_operation*, predecessor_operation*> ops,
-                 unique_lock<mutex>& mut, int tid = 0) {
-    parlay::sequence<int64_t> ops_sequence;
-    int n = ops.size();
-    pim_skip_list* ds = &pim_skip_list_drivers[tid];
-    {
-        if (check_result) {
-            ops_sequence =
-                parlay::tabulate(n, [&](size_t i) { return ops[i].key; });
-        }
+    static void predecessor(
+        slice<predecessor_operation*, predecessor_operation*> ops) {
+        cout << (batch_number++) << " " << __FUNCTION__ << " " << ops.size() << endl;
         auto ops2 = make_slice((int64_t*)ops.begin(), (int64_t*)ops.end());
-        time_nested("predecessor load", [&]() { ds->predecessor_load(ops2); });
-        mut.unlock();
-    }
-    {
-        shared_lock rLock(op_mutex);
-        // cout << (batch_number++) << " " << __FUNCTION__ << " " << tid << ' ' << ops.size() << endl;
-
-        time_nested("predecessor", [&]() { ds->predecessor(); });
-
+        time_start("predecessor");
+        auto v1 = pim_skip_list::predecessor(ops2);
+        time_end("predecessor");
         if (check_result) {
-            auto v1 = parlay::make_slice(ds->kv_output, ds->kv_output + n);
-            auto v2 = oracle.predecessor_batch(make_slice(ops_sequence));
+            auto v2 = oracle.predecessor_batch(ops2);
             if (!parlay::equal(v1, v2)) {
                 int n = v1.size();
                 for (int i = 0; i < n; i++) {
@@ -323,296 +278,219 @@ void predecessor(slice<predecessor_operation*, predecessor_operation*> ops,
             }
         }
     }
-}
 
-void insert(slice<insert_operation*, insert_operation*> ops,
-            unique_lock<mutex>& mut, int tid = 0) {
-    parlay::sequence<key_value> ops_sequence;
-    int n = ops.size();
-    pim_skip_list* ds = &pim_skip_list_drivers[tid];
-    {
-        if (check_result) {
-            ops_sequence =
-                parlay::tabulate(n, [&](size_t i) { return (key_value){.key = ops[i].key, .value = ops[i].value}; });
-        }
+    static void insert(slice<insert_operation*, insert_operation*> ops) {
+        cout << (batch_number++) << " " << __FUNCTION__ << " " << ops.size() << endl;
         auto ops2 = make_slice((key_value*)ops.begin(), (key_value*)ops.end());
-        time_nested("insert load", [&]() { ds->insert_load(ops2); });
-        mut.unlock();
-    }
-    {
-        unique_lock wLock(op_mutex);
-        cout << (batch_number++) << " " << __FUNCTION__ << " " << tid << " " << n << endl;
-        time_nested("insert", [&]() { ds->insert(); });
+        time_start("insert");
+        pim_skip_list::insert(ops2);
+        time_end("insert");
         if (check_result) {
-            oracle.insert_batch(make_slice(ops_sequence));
+            oracle.insert_batch(ops2);
         }
     }
-}
 
-void remove(slice<remove_operation*, remove_operation*> ops,
-            unique_lock<mutex>& mut, int tid = 0) {
-    parlay::sequence<int64_t> ops_sequence;
-    int n = ops.size();
-    pim_skip_list* ds = &pim_skip_list_drivers[tid];
-    {
-        if (check_result) {
-            ops_sequence =
-                parlay::tabulate(n, [&](size_t i) { return ops[i].key; });
-        }
+    static void remove(slice<remove_operation*, remove_operation*> ops) {
+        cout << (batch_number++) << " " << __FUNCTION__ << " " << ops.size() << endl;
         auto ops2 = make_slice((int64_t*)ops.begin(), (int64_t*)ops.end());
-        time_nested("remove load", [&]() { ds->remove_load(ops2); });
-        mut.unlock();
-    }
-    {
-        unique_lock wLock(op_mutex);
-        cout << (batch_number++) << " " << __FUNCTION__ << " " << tid  << " " << n << endl;
-        time_nested("remove", [&]() { ds->remove(); });
+        time_start("remove");
+        pim_skip_list::remove(ops2);
+        time_end("remove");
         if (check_result) {
-            oracle.remove_batch(make_slice(ops_sequence));
+            oracle.remove_batch(ops2);
         }
     }
-}
 
-const int _block_size = 1000;
-int l;
-parlay::sequence<size_t>* sums;
-int cnts[OPERATION_NR_ITEMS];
-int n, rounds;
-int T;
-
-void init(parlay::slice<operation*, operation*> ops, int load_batch_size,
-          int execute_batch_size) {
-    memset(op_count, 0, sizeof(op_count));
-    l = parlay::internal::num_blocks(load_batch_size, _block_size);
-    sums = new parlay::sequence<size_t>[OPERATION_NR_ITEMS];
-    for (int i = 0; i < OPERATION_NR_ITEMS; i++) {
-        sums[i] = parlay::sequence<size_t>(l);
-        cnts[i] = 0;
-    }
-    n = ops.size();
-    rounds = parlay::internal::num_blocks(n, load_batch_size);
-    T = 0;
-}
-
-mutex load_batch_mutex;
-
-bool load_one_batch(parlay::slice<operation*, operation*> ops,
-                    int load_batch_size) {
-    if (T >= rounds) {
-        return false;
-    }
-    int l = T * load_batch_size;
-    int r = min((T + 1) * load_batch_size, n);
-    int len = r - l;
-
-    auto mixed_op_batch = ops.cut(l, r);
-
-    parlay::internal::sliced_for(
-        len, _block_size, [&](size_t i, size_t s, size_t e) {
-            size_t c[OPERATION_NR_ITEMS] = {0};
-            for (size_t j = s; j < e; j++) {
-                int t = mixed_op_batch[j].type;
-                assert(j < (size_t)len);
-                assert(t >= 0 && t < OPERATION_NR_ITEMS);
-                c[t]++;
+    static void execute(parlay::slice<operation*, operation*> ops,
+                        int load_batch_size, int execute_batch_size) {
+        printf("execute n=%lu batchsize=%d,%d\n", ops.size(), load_batch_size,
+               execute_batch_size);
+        memset(op_count, 0, sizeof(op_count));
+        time_nested("global_exec", [&]() {
+            int _block_size = 1000;
+            int l = parlay::internal::num_blocks(load_batch_size, _block_size);
+            parlay::sequence<size_t>* sums =
+                new parlay::sequence<size_t>[OPERATION_NR_ITEMS];
+            int cnts[OPERATION_NR_ITEMS];
+            for (int i = 0; i < OPERATION_NR_ITEMS; i++) {
+                sums[i] = parlay::sequence<size_t>(l);
+                cnts[i] = 0;
             }
-            for (int j = 0; j < OPERATION_NR_ITEMS; j++) {
-                sums[j][i] = c[j];
-            }
-        });
-    for (int j = 0; j < OPERATION_NR_ITEMS; j++) {
-        cnts[j] = parlay::scan_inplace(parlay::make_slice(sums[j]),
-                                       parlay::addm<size_t>());
-    }
-    parlay::internal::sliced_for(
-        len, _block_size, [&](size_t i, size_t s, size_t e) {
-            size_t c[OPERATION_NR_ITEMS];
-            for (int j = 0; j < OPERATION_NR_ITEMS; j++) {
-                c[j] = sums[j][i] + op_count[j];
-            }
-            for (size_t j = s; j < e; j++) {
-                
-                operation t = mixed_op_batch[j];
-                
-                operation_t& operation_type = t.type;
-                int x = (int)operation_type;
-                switch (operation_type) {
-                    case operation_t::get_t: {
-                        get_ops[c[x]++] = t.tsk.g;
-                        break;
-                    }
-                    case operation_t::update_t: {
-                        update_ops[c[x]++] = t.tsk.u;
-                        break;
-                    }
-                    case operation_t::predecessor_t: {
-                        predecessor_ops[c[x]++] = t.tsk.p;
-                        break;
-                    }
-                    case operation_t::scan_t: {
-                        scan_ops[c[x]++] = t.tsk.s;
-                        break;
-                    }
-                    case operation_t::insert_t: {
-                        insert_ops[c[x]++] = t.tsk.i;
-                        break;
-                    }
-                    case operation_t::remove_t: {
-                        remove_ops[c[x]++] = t.tsk.r;
-                        break;
-                    }
-                    default: {
-                        assert(false);
-                    }
+
+            int n = ops.size();
+            int rounds = parlay::internal::num_blocks(n, load_batch_size);
+
+            for (int T = 0; T < rounds; T++) {
+                int l = T * load_batch_size;
+                int r = min((T + 1) * load_batch_size, n);
+                int len = r - l;
+
+                auto mixed_op_batch = ops.cut(l, r);
+
+                parlay::internal::sliced_for(
+                    len, _block_size, [&](size_t i, size_t s, size_t e) {
+                        size_t c[OPERATION_NR_ITEMS] = {0};
+                        for (size_t j = s; j < e; j++) {
+                            int t = mixed_op_batch[j].type;
+                            assert(j < (size_t)len);
+                            assert(t >= 0 && t < OPERATION_NR_ITEMS);
+                            c[t]++;
+                        }
+                        for (int j = 0; j < OPERATION_NR_ITEMS; j++) {
+                            sums[j][i] = c[j];
+                        }
+                    });
+                for (int j = 0; j < OPERATION_NR_ITEMS; j++) {
+                    cnts[j] = parlay::scan_inplace(parlay::make_slice(sums[j]),
+                                                   parlay::addm<size_t>());
                 }
-            }
-        });
-    for (int j = 0; j < OPERATION_NR_ITEMS; j++) {
-        op_count[j] += cnts[j];
-    }
-    T++;
-    return true;
-}
+                parlay::internal::sliced_for(
+                    len, _block_size, [&](size_t i, size_t s, size_t e) {
+                        size_t c[OPERATION_NR_ITEMS];
+                        for (int j = 0; j < OPERATION_NR_ITEMS; j++) {
+                            c[j] = sums[j][i] + op_count[j];
+                        }
+                        for (size_t j = s; j < e; j++) {
+                            operation_t& operation_type =
+                                mixed_op_batch[j].type;
+                            int x = (int)operation_type;
+                            operation& t = mixed_op_batch[j];
+                            switch (operation_type) {
+                                case operation_t::get_t: {
+                                    get_ops[c[x]++] = t.tsk.g;
+                                    break;
+                                }
+                                case operation_t::update_t: {
+                                    update_ops[c[x]++] = t.tsk.u;
+                                    break;
+                                }
+                                case operation_t::predecessor_t: {
+                                    predecessor_ops[c[x]++] = t.tsk.p;
+                                    break;
+                                }
+                                case operation_t::scan_t: {
+                                    scan_ops[c[x]++] = t.tsk.s;
+                                    break;
+                                }
+                                case operation_t::insert_t: {
+                                    insert_ops[c[x]++] = t.tsk.i;
+                                    break;
+                                }
+                                case operation_t::remove_t: {
+                                    remove_ops[c[x]++] = t.tsk.r;
+                                    break;
+                                }
+                                default: {
+                                    assert(false);
+                                }
+                            }
+                        }
+                    });
 
-operation_t batch_ready(int execute_batch_size) {
-    int scan_execute_batch_size = execute_batch_size / 100;
-    for (int j = 1; j < OPERATION_NR_ITEMS; j++) {
-        if (op_count[j] >= execute_batch_size && op_count[j] > 0) {
-            return (operation_t)j;
-        }
-    }
-    if (op_count[operation_t::scan_t] >= scan_execute_batch_size && op_count[operation_t::scan_t] > 0) {
-        return operation_t::scan_t;
-    }
-    return operation_t::empty_t;
-}
-
-int scan_start = 0;
-
-void run_batch(operation_t op_type, unique_lock<mutex>& mut, int tid) {
-    int count = op_count[(int)op_type];
-    if(op_type != operation_t::scan_t)
-        op_count[(int)op_type] = 0;
-
-    switch (op_type) {
-        case operation_t::get_t: {
-            core::get(parlay::make_slice(get_ops, get_ops + count), mut, tid);
-            break;
-        }
-        case operation_t::update_t: {
-            assert(false);
-            break;
-        }
-        case operation_t::predecessor_t: {
-            core::predecessor(
-                parlay::make_slice(predecessor_ops, predecessor_ops + count),
-                mut, tid);
-            break;
-        }
-        case operation_t::scan_t: {
-            int scan_batch = 10000;
-            if (count - scan_start >= scan_batch) {
-                core::scan(parlay::make_slice(scan_ops + scan_start, scan_ops + scan_start + scan_batch), mut, tid);
-                scan_start += scan_batch;
-            } else if(count - scan_start > 1) {
-                parlay::parallel_for(0, count - scan_start, [&](size_t i) {
-                    scan_ops[i] = scan_ops[i + scan_start];
-                });
-                op_count[(int)op_type] = count - scan_start;
-                scan_start = 0;
-                core::scan(parlay::make_slice(scan_ops, scan_ops + op_count[(int)op_type]), mut, tid);
-                op_count[(int)op_type] = 0;
-            }
-            else {
-                op_count[(int)op_type] = 0;
-                scan_start = 0;
-                mut.unlock();
-            }
-            break;
-        }
-        case operation_t::insert_t: {
-            core::insert(parlay::make_slice(insert_ops, insert_ops + count), mut, tid);
-            break;
-        }
-        case operation_t::remove_t: {
-            core::remove(parlay::make_slice(remove_ops, remove_ops + count), mut, tid);
-            break;
-        }
-        default: {
-            assert(false);
-            break;
-        }
-    }
-}
-
-bool finished() {
-    if (T < rounds) {
-        return false;
-    }
-    return true;
-}
-
-void execute(parlay::slice<operation*, operation*> ops, int load_batch_size,
-             int execute_batch_size, int threads) {
-    printf("execute n=%lu batchsize=%d,%d\n", ops.size(), load_batch_size,
-           execute_batch_size);
-    ASSERT(threads <= num_top_level_threads);
-    memset(op_count, 0, sizeof(op_count));
-    init(ops, load_batch_size, execute_batch_size);
-    atomic<int> num_finished_threads = 0;
-    parlay::parallel_for(
-        0, threads,
-        [&](size_t tid) {
-            cpu_coverage_timer->start();
-            pim_coverage_timer->start();
-            pim_coverage_timer->end();
-            time_nested("global_exec", [&]() {
-                printf("%d / %d *****!!! start\n", tid, threads);
-                while (true) {
-                    {
-                        unique_lock<mutex> lock(load_batch_mutex);
-                        time_start("load batch");
-                        operation_t op_type = operation_t::empty_t;
-                        while (true) {
-                            op_type = batch_ready(execute_batch_size);
-                            if (op_type != operation_t::empty_t) break;
-                            bool next_batch =
-                                load_one_batch(ops, load_batch_size);
-                            if (!next_batch) {
-                                op_type = batch_ready(1); // finish remaining tasks
+                for (int j = 0; j < OPERATION_NR_ITEMS; j++) {
+                    op_count[j] += cnts[j];
+                }
+                for (int j = 0; j < OPERATION_NR_ITEMS; j++) {
+                    if (op_count[j] >= execute_batch_size) {
+                        switch (j) {
+                            case (int)operation_t::get_t: {
+                                core::get(parlay::make_slice(
+                                    get_ops, get_ops + op_count[j]));
+                                break;
+                            }
+                            case (int)operation_t::update_t: {
+                                assert(false);
+                                break;
+                            }
+                            case (int)operation_t::predecessor_t: {
+                                core::predecessor(parlay::make_slice(
+                                    predecessor_ops,
+                                    predecessor_ops + op_count[j]));
+                                break;
+                            }
+                            case (int)operation_t::scan_t: {
+                                int scan_batch_size = execute_batch_size / 100;
+                                int ii = 0;
+                                for(ii = 0; ii < op_count[j] - scan_batch_size; ii += scan_batch_size){
+                                    core::scan(parlay::make_slice(
+                                        scan_ops + ii, scan_ops + ii + scan_batch_size));
+                                }
+                                core::scan(parlay::make_slice(
+                                    scan_ops + ii, scan_ops + op_count[j]));
+                                break;
+                            }
+                            case (int)operation_t::insert_t: {
+                                core::insert(parlay::make_slice(
+                                    insert_ops, insert_ops + op_count[j]));
+                                break;
+                            }
+                            case (int)operation_t::remove_t: {
+                                core::remove(parlay::make_slice(
+                                    remove_ops, remove_ops + op_count[j]));
                                 break;
                             }
                         }
-                        time_end("load batch");
-
-                        if (op_type == operation_t::empty_t) {
-                            break; // !next_batch
-                        }
-                        run_batch(op_type, lock, tid);  // may unlock here
+                        op_count[j] = 0;
                     }
                 }
-                cout << tid << "*****!!! finished" << endl;
-                num_finished_threads++;
-                if (tid == 0) {
-                    while (num_finished_threads.load() < threads) {
-                        this_thread::sleep_for(chrono::microseconds(100));
-                    }
-                }
-            });
-            cpu_coverage_timer->end();
-            pim_coverage_timer->start();
-            pim_coverage_timer->end();
-            if (tid == 0) {
-                assert(num_finished_threads.load() == threads);
             }
-        },
-        1);
-    printf("execute finish!\n");
-    fflush(stdout);
-    cout << oracle.inserted.size() << endl;
-}
+            
+            // finish remaining parts
+            {
+                for (int j = 0; j < OPERATION_NR_ITEMS; j++) {
+                    if (op_count[j] >= 1) {
+                        switch (j) {
+                            case (int)operation_t::get_t: {
+                                core::get(parlay::make_slice(
+                                    get_ops, get_ops + op_count[j]));
+                                break;
+                            }
+                            case (int)operation_t::update_t: {
+                                assert(false);
+                                break;
+                            }
+                            case (int)operation_t::predecessor_t: {
+                                core::predecessor(parlay::make_slice(
+                                    predecessor_ops,
+                                    predecessor_ops + op_count[j]));
+                                break;
+                            }
+                            case (int)operation_t::scan_t: {
+                                int scan_batch_size = execute_batch_size / 100;
+                                int ii = 0;
+                                for(ii = 0; ii < op_count[j] - scan_batch_size; ii += scan_batch_size){
+                                    core::scan(parlay::make_slice(
+                                        scan_ops + ii, scan_ops + ii + scan_batch_size));
+                                }
+                                core::scan(parlay::make_slice(
+                                    scan_ops + ii, scan_ops + op_count[j]));
+                                break;
+                            }
+                            case (int)operation_t::insert_t: {
+                                core::insert(parlay::make_slice(
+                                    insert_ops, insert_ops + op_count[j]));
+                                break;
+                            }
+                            case (int)operation_t::remove_t: {
+                                core::remove(parlay::make_slice(
+                                    remove_ops, remove_ops + op_count[j]));
+                                break;
+                            }
+                        }
+                        op_count[j] = 0;
+                    }
+                }
+            }
+        });
+        printf("execute finish!\n");
+        fflush(stdout);
+        cout << oracle.inserted.size() << endl;
+    }
+};
 
-};  // namespace core
+batch_parallel_oracle core::oracle;
+bool core::check_result = true;
+int core::batch_number = 0;
 
 class frontend {
    public:
@@ -641,8 +519,11 @@ class frontend_by_file : public frontend {
         if (init_n == -1) {
             return ops;
         } else {
-            return tabulate(init_n, [&](size_t i) { return ops[i]; });
+            return tabulate(init_n, [&](size_t i) {
+                return ops[i];
+            });
         }
+        // return ops;
     }
 
     sequence<operation> test_tasks() {
@@ -652,8 +533,11 @@ class frontend_by_file : public frontend {
         if (test_n == -1) {
             return ops;
         } else {
-            return tabulate(test_n, [&](size_t i) { return ops[i]; });
+            return tabulate(test_n, [&](size_t i) {
+                return ops[i];
+            });
         }
+        // return ops;
     }
 };
 
@@ -663,22 +547,20 @@ class frontend_by_generation : public frontend {
     sequence<double> pos;
     int bias;
     batch_parallel_oracle oracle;
-    int init_batch_size;
-    int test_batch_size;
+    int execute_batch_size;
 
     frontend_by_generation(int _init_n, int _test_n, sequence<double> _pos,
-                           int _bias, int _init_batch_size, int _test_batch_size)
+                           int _bias, int _size)
         : init_n{_init_n},
           test_n{_test_n},
           pos{_pos},
           bias{_bias},
-          init_batch_size{_init_batch_size},
-          test_batch_size{_test_batch_size} {}
+          execute_batch_size{_size} {}
 
     sequence<operation> init_tasks() {
         sequence<double> init_pos = sequence<double>(OPERATION_NR_ITEMS, 0);
         init_pos[operation_t::insert_t] = 1.0;
-        test_generator tg(make_slice(init_pos), init_batch_size);
+        test_generator tg(make_slice(init_pos), execute_batch_size);
         auto ops = sequence<operation>(init_n);
         tg.fill_with_random_ops(make_slice(ops));
         auto kvs = parlay::delayed_seq<key_value>(ops.size(), [&](size_t i) {
@@ -691,10 +573,13 @@ class frontend_by_generation : public frontend {
 
     sequence<operation> test_tasks() {
         assert(pos.size() == OPERATION_NR_ITEMS);
-        test_generator tg(make_slice(this->pos), test_batch_size);
+        test_generator tg(make_slice(this->pos), execute_batch_size);
         auto ops = sequence<operation>(test_n);
+        // auto keys = parlay::delayed_seq<int64_t>(
+        //     oracle.inserted.size(),
+        //     [&](size_t i) { return oracle.inserted[i].key; });
         tg.fill_with_biased_ops(make_slice(ops), false, 0.0, bias, oracle,
-                                test_batch_size);
+                                execute_batch_size);
         return ops;
     }
 };
@@ -724,12 +609,8 @@ class frontend_testgen {
         assert(pos.size() == OPERATION_NR_ITEMS);
         test_generator tg(make_slice(possi), execute_batch_size);
         auto ops = sequence<operation>(n);
-        if(pos[operation_t::scan_t] > 0)
-            tg.fill_with_biased_ops(make_slice(ops), zipf, alpha, bias, oracle,
-                                    execute_batch_size / 100);
-        else
-            tg.fill_with_biased_ops(make_slice(ops), zipf, alpha, bias, oracle,
-                                    execute_batch_size);
+        tg.fill_with_biased_ops(make_slice(ops), zipf, alpha, bias, oracle,
+                                execute_batch_size);
         return ops;
     }
 
@@ -763,179 +644,44 @@ class frontend_testgen {
         }
     }
 
-    void generate_microbenchmark_one_type(int t) {
-        if (t == operation_t::update_t) return;
-        auto pos = sequence<double>(OPERATION_NR_ITEMS, 0);
-        pos[t] = 1.0;
-        for (double alpha = 0.0; alpha <= 1.2; alpha += 0.2) {
-            double aalpha = alpha;
-            if(alpha == 1.0) aalpha = 0.99;
-            parlay::sequence<operation> ops;
-            if (t == operation_t::scan_t) {
-                int expected_length = 100;
-                ops = generate_tasks(pos, test_n / expected_length, true, aalpha, 1.0);
-            } else {
-                ops = generate_tasks(pos, test_n, true, aalpha, 1.0);
-            }
-            char filename[500];
-            sprintf(filename, "test_%d_%.1f_%d.binary", test_n, alpha, t);
-            write_ops_to_file(string(filename), make_slice(ops));
-            cout << filename << endl;
-        }
-    }
-
-    void generate_microbenchmarks() {
-        for (int t = 1; t < OPERATION_NR_ITEMS; t++) {
-            generate_microbenchmark_one_type(t);
-        }
-    }
-
-    void generate_YCSB_benchmark() {
-        auto typechecker = [&](auto ops) {
-            int x[OPERATION_NR_ITEMS];
-            memset(x, 0, sizeof(x));
-            for (int i = 0; i < ops.size(); i ++) {
-                operation_t k = ops[i].type;
-                x[k] ++;
-            }
-            for (int i = 0; i < OPERATION_NR_ITEMS; i ++) {
-                printf("%d %d\n", i, x[i]);
-            }
-        };
-
-        // YCSB A = 50% predecessor : 50% insert
-        for (double alpha = 0.0; alpha < 1.1; alpha += 1.0) {
-            auto pos = sequence<double>(OPERATION_NR_ITEMS, 0);
-            pos[operation_t::predecessor_t] = 1.0;
-            auto ops = generate_tasks(pos, test_n, true, alpha, 1.0);
-            ASSERT(ops.size() == 1e8);
-            for (int i = 0; i < ops.size(); i ++) {
-                operation original_task = ops[i];
-                if (rand() % 2 == 0) {
-                    operation switched_task;
-                    switched_task.type = operation_t::insert_t;
-                    switched_task.tsk.i = (insert_operation){.key = original_task.tsk.p.key};
-                    ops[i] = switched_task;
-                }
-            }
-            char filename[500];
-            sprintf(filename, "test_%d_%.1f_ycsb_a.binary", test_n, alpha);
-            typechecker(ops);
-            write_ops_to_file(string(filename), make_slice(ops));
-            cout << filename << endl;
-        }
-
-        // YCSB B = 95% predecessor : 5% insert
-        for (double alpha = 0.0; alpha < 1.1; alpha += 1.0) {
-            auto pos = sequence<double>(OPERATION_NR_ITEMS, 0);
-            pos[operation_t::predecessor_t] = 1.0;
-            auto ops = generate_tasks(pos, test_n, true, alpha, 1.0);
-            ASSERT(ops.size() == 1e8);
-            for (int i = 0; i < ops.size(); i ++) {
-                operation original_task = ops[i];
-                if (rand() % 20 == 0) {
-                    operation switched_task;
-                    switched_task.type = operation_t::insert_t;
-                    switched_task.tsk.i = (insert_operation){.key = original_task.tsk.p.key};
-                    ops[i] = switched_task;
-                }
-            }
-            char filename[500];
-            sprintf(filename, "test_%d_%.1f_ycsb_b.binary", test_n, alpha);
-            typechecker(ops);
-            write_ops_to_file(string(filename), make_slice(ops));
-            cout << filename << endl;
-        }
-
-        // YCSB C = micro predecessor
-        for (double alpha = 0.0; alpha < 1.1; alpha += 1.0) {
-            char filename[500];
-            sprintf(filename, "test_%d_%.1f_ycsb_c.binary", test_n, alpha);
-            string targetname(filename);
-            sprintf(filename, "test_%d_%.1f_%d.binary", test_n, alpha, predecessor_t);
-            string sourcename(filename);
-            {
-                struct stat statbuf;
-                assert(stat(sourcename.c_str(), &statbuf) == 0);
-                // otherwise source file doesn't exist
-            }
-            string cmd = "cp '" + sourcename + "' '" + targetname + "'";
-            cout<<targetname<<endl;
-            system(cmd.c_str());
-        }
-
-        // YCSB D = micro insert
-        for (double alpha = 0.0; alpha < 1.1; alpha += 1.0) {
-            char filename[500];
-            sprintf(filename, "test_%d_%.1f_ycsb_d.binary", test_n, alpha);
-            string targetname(filename);
-            sprintf(filename, "test_%d_%.1f_%d.binary", test_n, alpha, insert_t);
-            string sourcename(filename);
-            {
-                struct stat statbuf;
-                assert(stat(sourcename.c_str(), &statbuf) == 0);
-                // otherwise source file doesn't exist
-            }
-            string cmd = "cp '" + sourcename + "' '" + targetname + "'";
-            cout<<targetname<<endl;
-            system(cmd.c_str());
-        }
-
-        // YCSB E = 95% scan : 5% insert
-        for (double alpha = 0.0; alpha < 1.1; alpha += 1.0) {
-            auto pos = sequence<double>(OPERATION_NR_ITEMS, 0);
-            pos[operation_t::scan_t] = 1.0;
-            auto ops = generate_tasks(pos, test_n / 100, true, alpha, 1.0);
-            ASSERT(ops.size() == 1e8);
-            for (int i = 0; i < ops.size(); i ++) {
-                operation original_task = ops[i];
-                if (rand() % 20 == 0) {
-                    operation switched_task;
-                    switched_task.type = operation_t::insert_t;
-                    switched_task.tsk.i = (insert_operation){.key = original_task.tsk.s.lkey};
-                    ops[i] = switched_task;
-                }
-            }
-            char filename[500];
-            sprintf(filename, "test_%d_%.1f_ycsb_e.binary", test_n, alpha);
-            typechecker(ops);
-            write_ops_to_file(string(filename), make_slice(ops));
-            cout << filename << endl;
-        }
-    }
-
     void generate_all_test() {
-        fs::path workload_directory = "/scratch/pim_workloads";
-        fs::create_directories(workload_directory);
         if (this->init_file.length() == 0) {
-            write_init_file((workload_directory/"init.in").c_str());
-            this->init_file = (workload_directory/"init.in");
+            write_init_file("/scratch/hongbo/init.in");
         } else {
-            fs::path init_file_path(this->init_file);
-            workload_directory = init_file_path.remove_filename();
             auto ops = read_op_file(this->init_file, [&](const operation& op) {
                 assert(op.type == insert_t);
             });
             init_oracle(make_slice(ops));
-            printf("load finished\n");
-            string sorted_input_file = this->init_file + "sorted";
-            if (!filesystem::exists(sorted_input_file)) {
-                auto ops_sorted =
-                    parlay::sort(ops, [](const operation& a, const operation& b) {
-                        return a.tsk.i.key < b.tsk.i.key;
-                    });
-                write_ops_to_file(sorted_input_file, make_slice(ops_sorted));
-                printf("generate sorted init\n");
+
+            auto ops_sorted =
+                parlay::sort(ops, [](const operation& a, const operation& b) {
+                    return a.tsk.i.key < b.tsk.i.key;
+                });
+            write_ops_to_file("/scratch/hongbo/init_sorted.in",
+                              make_slice(ops_sorted));
+        }
+        cout << "finish init" << endl;
+
+        for (int t = 1; t < OPERATION_NR_ITEMS; t++) {
+            if (t == 2 || t == 4 || t == 6) continue;
+            auto pos = sequence<double>(OPERATION_NR_ITEMS, 0);
+            pos[t] = 1.0;
+            for (double alpha = 0.0; alpha <= 1.0; alpha += 0.2) {
+                alpha = 0.99;
+                auto ops = generate_tasks(pos, test_n, true, alpha, 1.0);
+                stringstream ss;
+                ss << "/scratch/hongbo/test_" << test_n << "_" << alpha << "_"
+                   << t << ".in";
+                string filename;
+                ss >> filename;
+                write_ops_to_file(filename, make_slice(ops));
+                cout << filename << endl;
+                if (alpha == 0.99) {
+                    break;
+                }
             }
         }
-
-        cout << "finish init" << endl;
-        filesystem::current_path(workload_directory);
-        // generate_microbenchmark_one_type(operation_t::scan_t);
-        // exit(0);
-
-        generate_microbenchmarks();
-        generate_YCSB_benchmark();
+        exit(0);
     }
 };
 
@@ -948,9 +694,7 @@ class driver {
             .default_value(vector<string>())
             .nargs(2);
         program.add_argument("--nocheck", "-c")
-            .help(
-                "stop checking the correctness of the tested data "
-                "structure")
+            .help("stop checking the correctness of the tested data structure")
             .default_value(false)
             .implicit_value(true);
         program.add_argument("--noprint", "-t")
@@ -988,31 +732,15 @@ class driver {
         program.add_argument("--length", "-l")
             .help("-l [init_length] [test_length]")
             .nargs(2)
-            .default_value(vector<int>{40000000, 20000000})
+            .default_value(vector<int>{80000000, 20000000})
             .scan<'i', int>();
-        program.add_argument("--init_batch_size")
-            .help("--init_batch_size [init batch size]")
-            .default_value(1000000)
-            .scan<'i', int>();
-        program.add_argument("--test_batch_size")
-            .help("--test_batch_size [test batch size]")
-            .default_value(1000000)
-            .scan<'i', int>();
-        program.add_argument("--output_batch_size")
-            .help("--output_batch_size [batch size for output file]")
+        program.add_argument("--batch", "-b")
+            .help("-b [batch_size]")
             .default_value(1000000)
             .scan<'i', int>();
         program.add_argument("--bias")
             .help("--bias [?x]")
             .default_value(1)
-            .scan<'i', int>();
-        program.add_argument("--top_level_threads")
-            .help("--top_level_threads [#threads]")
-            .default_value(1)
-            .scan<'i', int>();
-        program.add_argument("--wait_microsecond")
-            .help("--wait_microsecond [#microsecond between each]")
-            .default_value(0)
             .scan<'i', int>();
         program.add_argument("--alpha")
             .help("--alpha [?x]")
@@ -1022,10 +750,6 @@ class driver {
             .help("--output [init_file] [test_file]")
             .default_value(vector<string>())
             .nargs(2);
-        program.add_argument("--push_pull_limit_dynamic")
-            .help("--push_pull_limit_dynamic [limit] (limit for pull/push, limit * 2 for shadow push)")
-            .default_value(L2_SIZE)
-            .scan<'i', int>();
         program.add_argument("--generate_all_test_cases")
             .help("generate all test cases [initfile]")
             .default_value(string(""));
@@ -1037,67 +761,59 @@ class driver {
         return program;
     }
 
+    // static void test_by_generator(parlay::sequence<double> pos, int init_n,
+    //                               int test_n, int batch_size) {
+    //     frontend_by_generation t(move(pos));
+    //     t.init(init_n, batch_size);
+    //     t.run(test_n, batch_size);
+    // }
+
     static void init() {
         rn_gen::init();
         init_io_managers();
     }
 
-    static void run(frontend& f, int init_batch_size, int test_batch_size) {
-        pim_skip_list_drivers = new pim_skip_list[core::num_top_level_threads];
-        pim_skip_list_drivers[0].init();
-        
+    static void run(frontend& f, int batch_size) {
+        pim_skip_list::init();
+        // pim_skip_list::init_state = true;
         {
             auto init_ops = f.init_tasks();
-            cpu_coverage_timer->reset();
-            pim_coverage_timer->reset();
-            core::execute(make_slice(init_ops), init_batch_size,
-                          init_batch_size, 1);
+            core::execute(make_slice(init_ops), batch_size, batch_size);
         }
+        pim_skip_list::init_state = false;
         total_communication = 0;
         total_actual_communication = 0;
-
-        for (int i = 0; i < core::num_top_level_threads; i ++) {
-            pim_skip_list_drivers[i].push_pull_limit_dynamic = core::push_pull_limit_dynamic;
-        }
-
-        dpu_energy_stats(false);
         reset_all_timers();
         {
             auto test_ops = f.test_tasks();
-            cpu_coverage_timer->reset();
-            pim_coverage_timer->reset();
 
-#ifdef USE_PAPI
+            dpu_energy_stats(false);
+            #ifdef USE_PAPI
             papi_init_program(parlay::num_workers());
             papi_reset_counters();
             papi_turn_counters(true);
             papi_check_counters(parlay::worker_id());
             papi_wait_counters(true, parlay::num_workers());
-#endif
+            #endif
 
-            core::execute(make_slice(test_ops), test_batch_size,
-                          test_batch_size, core::num_top_level_threads);
+            core::execute(make_slice(test_ops), batch_size, batch_size);
 
-#ifdef USE_PAPI
+            #ifdef USE_PAPI
             papi_turn_counters(false);
             papi_check_counters(parlay::worker_id());
             papi_wait_counters(false, parlay::num_workers());
-#endif
+            #endif
 
-            print_all_timers(print_type::pt_full);
-            print_all_timers(print_type::pt_name);
-            print_all_timers(print_type::pt_time);
-            print_all_timers_average();
-            cpu_coverage_timer->print(pt_full);
-            pim_coverage_timer->print(pt_full);
+            print_all_timers(timer::print_type::pt_full);
+            print_all_timers(timer::print_type::pt_time);
+            print_all_timers(timer::print_type::pt_name);
 
-#ifdef USE_PAPI
+            dpu_energy_stats(false);
+          
+            #ifdef USE_PAPI
             papi_print_counters(1);
-#endif
+            #endif
         }
-
-        dpu_energy_stats(false);
-        delete[] pim_skip_list_drivers;
     }
 
     static void exec(int argc, char* argv[]) {
@@ -1122,17 +838,6 @@ class driver {
         timer::print_when_time = (program["--noprint"] == false);
         timer::default_detail = (program["--nodetail"] == false);
         int bias = program.get<int>("--bias");
-        core::push_pull_limit_dynamic = program.get<int>("--push_pull_limit_dynamic");
-
-        core::num_top_level_threads = program.get<int>("--top_level_threads");
-
-        core::num_wait_microsecond = program.get<int>("--wait_microsecond");
-        ASSERT(core::num_top_level_threads >= 1);
-        ASSERT(core::num_wait_microsecond >= 0);
-        cout << "thread: " << core::num_top_level_threads << endl;
-        cout << "wait: " << core::num_wait_microsecond << " microsecond"
-             << endl;
-
         double alpha = program.get<double>("--alpha");
         auto files = program.get<vector<string>>("-f");
         auto output_file = program.get<vector<string>>("-o");
@@ -1140,15 +845,21 @@ class driver {
         assert(ns.size() == 2);
         int init_n = ns[0];
         int test_n = ns[1];
-        int init_batch_size = program.get<int>("--init_batch_size");
-        int test_batch_size = program.get<int>("--test_batch_size");
-        int output_batch_size = program.get<int>("--output_batch_size");
+        int batch_size = program.get<int>("-b");
+        pim_skip_list::init_state = (program["--init_state"] == true);
+        // bool generate_all_testcases =
+        //     (program["--generate_all_test_cases"] == true);
 
         if (program.is_used("--generate_all_test_cases") == true) {
+            printf("To generated file:\n");
+            for (int i = 1; i < OPERATION_NR_ITEMS; i++) {
+                printf("pos[%d]=%lf\n", i, pos[i]);
+            }
+            printf("\n");
             cout << "start generating all tests" << endl;
             string init_file = program.get<string>("--generate_all_test_cases");
             frontend_testgen frontend(init_n, test_n, move(pos), bias,
-                                      init_file, "", output_batch_size);
+                                      init_file, "", batch_size);
             frontend.generate_all_test();
         } else if (files.size() > 0) {  // test from file
             assert(files.size() == 2);
@@ -1160,7 +871,7 @@ class driver {
                 tn = ns[1];
             }
             frontend_by_file frontend(files[0], files[1], in, tn);
-            run(frontend, init_batch_size, test_batch_size);
+            run(frontend, batch_size);
         } else if (output_file.size() > 0) {  // print test file
             assert(output_file.size() == 2);
             printf("To generated file:\n");
@@ -1171,7 +882,7 @@ class driver {
 
             frontend_testgen frontend(init_n, test_n, move(pos), bias,
                                       output_file[0], output_file[1],
-                                      output_batch_size);
+                                      batch_size);
             frontend.write_file();
         } else {  // in memory test
             printf("Test with generated data:\n");
@@ -1185,15 +896,12 @@ class driver {
             int init_n = ns[0];
             int test_n = ns[1];
             frontend_by_generation frontend(init_n, test_n, move(pos), bias,
-                                            init_batch_size, test_batch_size);
-            run(frontend, init_batch_size, test_batch_size);
+                                            batch_size);
+            run(frontend, batch_size);
         }
 
-        // print_all_timers(print_type::pt_full);
-        // print_all_timers(print_type::pt_time);
-        // print_all_timers(print_type::pt_name);
-        cout << "total communication" << total_communication.load() << endl;
-        cout << "total actual communication"
-             << total_actual_communication.load() << endl;
+        cout << "total communication " << total_communication << endl;
+        cout << "total actual communication " << total_actual_communication
+             << endl;
     }
 };

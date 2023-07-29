@@ -111,14 +111,6 @@ static inline void m_read(__mram_ptr void* mptr, void* ptr, int size) {
 #endif
 }
 
-static inline void m_read_single(mpvoid mptr, void* ptr, int size) {
-    mram_read(mptr, ptr, size);
-#ifdef DPU_ENERGY
-    op_count ++;
-    db_size_count += size;
-#endif
-}
-
 static inline void m_write(void* ptr, __mram_ptr void* mptr, int size) {
     for (int i = 0; i < size; i += MRAM_OP_SIZE) {
         int cursize = MIN(MRAM_OP_SIZE, size - i);
@@ -130,14 +122,6 @@ static inline void m_write(void* ptr, __mram_ptr void* mptr, int size) {
 #endif
     }
 #ifdef DPU_ENERGY
-    db_size_count += size;
-#endif
-}
-
-static inline void m_write_single(void* ptr, mpvoid mptr, int size) {
-    mram_write(ptr, mptr, size);
-#ifdef DPU_ENERGY
-    op_count ++;
     db_size_count += size;
 #endif
 }

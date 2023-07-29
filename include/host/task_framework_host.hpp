@@ -18,16 +18,14 @@
 #include <parlay/sequence.h>
 #include <parlay/primitives.h>
 #include <parlay/internal/integer_sort.h>
-#include <parlay/papi/papi_util_impl.h>
-#include <mutex>
 
 #define SEND_RECEIVE_ASYNC_STATE (DPU_XFER_DEFAULT)
 
 // IRAM friendly
 using namespace std;
 
-atomic<uint64_t> total_communication = 0;
-atomic<uint64_t> total_actual_communication = 0;
+uint64_t total_communication = 0;
+uint64_t total_actual_communication = 0;
 
 struct count_size {
     int32_t cnt;
@@ -110,20 +108,6 @@ class IO_Task_Block {
         }
         if (content_type == variable_length) {
             offsets[send_cs.cnt] = send_cs.size;
-        }
-        return base + send_cs.size;
-    }
-
-    void* push_multiple_tasks_zero_copy(int length, int count, bool atomic, int* cnt) {
-        ASSERT(state == loading_tasks);
-        ASSERT(content_type == fixed_length);
-        length = task_length;
-        count_size send_cs = inc_cs(&cs, count, count * length, atomic);
-        ASSERT(send_cs.cnt < MAX_TASK_COUNT_PER_DPU_PER_BLOCK);
-        ASSERT_EXEC(send_cs.size < MAX_TASK_BUFFER_SIZE_PER_DPU,
-                    { printf("target=%d siz=%d\n", target, send_cs.size); });
-        if (cnt != NULL) {
-            *cnt = send_cs.cnt;
         }
         return base + send_cs.size;
     }
@@ -236,10 +220,8 @@ class IO_Task_Batch {
             tbs[0].init(ct, task_type, _bases[0], offset_bufs[0], length, 0);
         } else {
             parlay::parallel_for(0, nr_of_dpus, [&](size_t i) {
-                // for (int i = 0; i < nr_of_dpus; i++) {
                 tbs[i].init(ct, task_type, _bases[i], offset_bufs[i], length,
                             i);
-                // }
             });
         }
     }
@@ -303,7 +285,7 @@ class IO_Task_Batch {
 
         parlay::parallel_for(0, num_buckets, [&](size_t i) {
             ASSERT_EXEC(counts[i] < MAX_TASK_COUNT_PER_DPU_PER_BLOCK, {
-                cout << "i=" << i << " count=" << counts[i] << endl;
+                cout<<"i="<<i<<" count="<<counts[i]<<endl;
             });
             tbs[i].cs = (count_size){
                 .cnt = (int)counts[i],
@@ -316,7 +298,7 @@ class IO_Task_Batch {
     template <typename F, typename G>
     void push_task_from_array(int length, F idx_generator, G task_generator) {
         if (length > 100000) {
-            assert(false);
+            ASSERT(false);
         } else {
             parfor_wrap(0, length, [&](size_t i) {
                 task_idx idx = idx_generator(i);
@@ -345,25 +327,6 @@ class IO_Task_Batch {
         return tbs[send_id].push_task_zero_copy(length, atomic, cnt);
     }
 
-    void* push_multiple_tasks_zero_copy(int send_id, int length, int count,
-                                        bool atomic, int* cnt = nullptr) {
-        ASSERT(state == loading_tasks);
-        // ASSERT(ct == fixed_length);
-#ifdef KHB_CPU_DEBUG
-        if (btt == broadcast) {
-            ASSERT(send_id == -1);
-        } else {
-            ASSERT_EXEC((send_id >= 0 && send_id < nr_of_dpus),
-                        { printf("send id = %d\n", send_id); });
-        }
-#endif
-        if (btt == broadcast) {
-            send_id = 0;
-        }
-        return tbs[send_id].push_multiple_tasks_zero_copy(length, count, atomic,
-                                                          cnt);
-    }
-
     bool finish(uint8_t** starts) {
         bool empty = true;
         auto tsk = [this, &starts, &empty](int i) {
@@ -378,6 +341,7 @@ class IO_Task_Batch {
         } else {
             parfor_wrap(0, nr_of_dpus, [&](size_t i) { tsk(i); });
         }
+        // ASSERT(!empty);
         return !empty;
     }
 
@@ -413,10 +377,13 @@ class IO_Task_Batch {
         return tbs[receive_id].ith(offset);
     }
 
-    void* get_reply(int offset, int receive_id) {  // obsolete api
+    void* get_reply(int offset, int receive_id) { // obsolete api
         return ith(receive_id, offset);
     }
 };
+
+
+// enum IO_Manager_State { idle, loading_tasks, supplying_responces };
 
 class IO_Manager {
    private:
@@ -442,29 +409,19 @@ class IO_Manager {
     int broadcast_receive_length[1];
 
    public:
-    size_t tid; // the worker id of the controlling thread
-    int id; // the id of this io manager
-    inline static mutex alloc_io_manager_mutex;
-    inline static atomic<IO_Manager*> working_manager;
+    static IO_Manager* working_manager;
     State io_manager_state;
     IO_Task_Batch tbs[MAX_IO_BLOCKS];
 
     IO_Manager() {
         direct_buffer = new uint8_t[NR_DPUS][MAX_TASK_BUFFER_SIZE_PER_DPU];
-        memset(direct_buffer, 0,
-               sizeof(uint8_t) * NR_DPUS * MAX_TASK_BUFFER_SIZE_PER_DPU);
+        memset(direct_buffer, 0, sizeof(uint8_t) * NR_DPUS * MAX_TASK_BUFFER_SIZE_PER_DPU);
     }
 
-    void reset() {
-        unique_lock wLock(alloc_io_manager_mutex);
-        ASSERT(tid == worker_id());
-        tid = (size_t)-1;
-        io_manager_state = idle;
-    }
+    void reset() { io_manager_state = idle; }
 
     void init() {
         ASSERT(io_manager_state == pre_init);
-        ASSERT(tid == worker_id());
         cnt = 0;
         broadcast_cnt = direct_cnt = 0;
         broadcast_buffer_head[0] = broadcast_buffer[0] + CPU_DPU_HEADER;
@@ -482,7 +439,6 @@ class IO_Manager {
                                     Block_Content_Type send_ct,
                                     Block_Content_Type receive_ct,
                                     int task_type, int len, int reply_len) {
-        ASSERT(tid == worker_id());
         ASSERT(io_manager_state == loading_finished);
         ASSERT(!(receive_ct == variable_length && btt == broadcast));
 
@@ -515,7 +471,6 @@ class IO_Manager {
 
     template <typename Task, typename Reply>
     IO_Task_Batch* alloc(Batch_Transmit_Type btt) {
-        ASSERT(tid == worker_id());
         Block_Content_Type send_ct =
             Task::fixed ? fixed_length : variable_length;
         Block_Content_Type receive_ct =
@@ -554,7 +509,6 @@ class IO_Manager {
     void print_all_buffer(bool x16 = false) {
         bool sending = (io_manager_state == loading_tasks ||
                         io_manager_state == loading_finished);
-        ASSERT(tid == worker_id());
         if (sending) {
             if (direct_cnt > 0) {
                 printf("\nDirect:\n");
@@ -615,7 +569,6 @@ class IO_Manager {
     }
 
     bool send_task() {
-        ASSERT(tid == worker_id());
         ASSERT(cnt > 0 && tbs[cnt - 1].state == loading_finished);
         ASSERT((direct_cnt > 0) || (broadcast_cnt > 0));
 
@@ -668,7 +621,7 @@ class IO_Manager {
             }
             return ret;
         };
-
+        
         int direct_length = get_direct_size();
 
         time_end("pre send");
@@ -693,8 +646,7 @@ class IO_Manager {
             get_size_sum(size_sum, size_max);
 
             total_communication += size_sum;
-            total_actual_communication +=
-                (uint64_t)size_max * (uint64_t)nr_of_dpus;
+            total_actual_communication += (uint64_t)size_max * (uint64_t)nr_of_dpus; 
 
 #ifdef PRINT_IO
             printf(
@@ -736,10 +688,9 @@ class IO_Manager {
                     DPU_ASSERT(dpu_prepare_xfer(dpu, direct_buffer[each_dpu]));
                 }
 #ifdef IRAM_FRIENDLY
-                DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
-                                         DPU_MRAM_HEAP_POINTER_NAME,
-                                         DPU_MRAM_HEAP_START_SAFE_BUFFER, size,
-                                         SEND_RECEIVE_ASYNC_STATE));
+                DPU_ASSERT(dpu_push_xfer(
+                    dpu_set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME,
+                    DPU_MRAM_HEAP_START_SAFE_BUFFER, size, SEND_RECEIVE_ASYNC_STATE));
 #else
             DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
                                      DPU_MRAM_HEAP_POINTER_NAME, 0, size,
@@ -773,7 +724,6 @@ class IO_Manager {
                     direct_length + cnt_length, SEND_RECEIVE_ASYNC_STATE));
             }
         });
-
         parlay::deactivate_scheduling(false);
 
         io_manager_state = loading_finished;
@@ -796,7 +746,7 @@ class IO_Manager {
             dpu_set, DPU_XFER_FROM_DPU, DPU_MRAM_HEAP_POINTER_NAME,
             DPU_SEND_BUFFER_OFFSET + offset + DPU_MRAM_HEAP_START_SAFE_BUFFER,
             length, SEND_RECEIVE_ASYNC_STATE));
-
+        
 #else
         DPU_ASSERT(dpu_push_xfer(
             dpu_set, DPU_XFER_FROM_DPU, DPU_MRAM_HEAP_POINTER_NAME,
@@ -822,8 +772,6 @@ class IO_Manager {
     }
 
     bool receive_task() {
-        time_start("pre_working");
-        ASSERT(tid == worker_id());
         ASSERT(io_manager_state == loading_finished);
 
         int cnt_length = (sizeof(int64_t) + DPU_CPU_BLOCK_HEADER) * cnt;
@@ -835,7 +783,6 @@ class IO_Manager {
 
         ASSERT(broadcast_cnt != 0 || broadcast_length == 0);
         ASSERT(direct_cnt != 0 || direct_length == 0);
-        time_end("pre_working");
 
 #ifndef KHB_CPU_DEBUG
         if ((broadcast_length + direct_length) == 0) {
@@ -862,6 +809,7 @@ class IO_Manager {
         ASSERT(io_manager_state == waiting_for_sync);
 
         auto quit = [&]() {
+            io_manager_state = idle;
             return false;
         };
 
@@ -875,7 +823,6 @@ class IO_Manager {
                         [&](auto x) -> bool { return x == i; });
                     cout << "Quit From DPU!" << endl;
                     fail = true;
-                    break;
                 }
             }
             if (fail) {
@@ -926,7 +873,7 @@ class IO_Manager {
 #endif
 
 #ifdef INFO_IO_BALANCE
-        time_nested("io count", [&](){
+        {
             int size_sum = 0, size_max = 0;
             auto get_size_sum = [&](int& size_sum, int& size_max) -> void {
                 if (direct_cnt == 0) {
@@ -943,20 +890,17 @@ class IO_Manager {
             };
             get_size_sum(size_sum, size_max);
             total_communication += size_sum;
-            total_actual_communication +=
-                (uint64_t)size_max * (uint64_t)nr_of_dpus;
+            total_actual_communication += (uint64_t)size_max * (uint64_t)nr_of_dpus; 
 #ifdef PRINT_IO
             printf("receive %d : sum=%d max=%d ratio=%lf\n", epoch_number,
                    size_sum, size_max,
                    ((double)size_sum / size_max) / nr_of_dpus);
 #endif
-        });
+        }
 #endif
 
         int64_t lengths[NR_DPUS];
-        time_nested("more fetching", [&]() {
-            more_fetching(lengths, receive_length);
-        });
+        more_fetching(lengths, receive_length);
 
         time_nested("post receiving", [&]() {
             int64_t receive_batch_offsets[NR_DPUS][MAX_IO_BLOCKS];
@@ -993,19 +937,10 @@ class IO_Manager {
         return true;
     }
 
-    bool successful_send;
-
     bool exec() {
-        ASSERT(tid == worker_id());
-        cpu_coverage_timer->end();
-        time_nested(string("lock"), [&]() {
-            dpu_control::dpu_mutex.lock();
-        });
-        cpu_coverage_timer->start();
-
         epoch_number++;
 
-        ASSERT(working_manager.load() == nullptr);
+        ASSERT(working_manager == nullptr);
         working_manager = this;
 
         bool successful_send = false;
@@ -1013,56 +948,45 @@ class IO_Manager {
             successful_send = send_task();
         });
 
-        bool ret = false;
         if (successful_send) {
-            cpu_coverage_timer->end();
-            pim_coverage_timer->start();
             time_nested("dpu", [&]() {
-                DPU_ASSERT(dpu_launch(dpu_set, DPU_ASYNCHRONOUS));
-                while (!dpu_control::ready()) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
-                }
+                DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));
                 // DPU_ASSERT(dpu_launch(dpu_set, DPU_ASYNCHRONOUS));
                 // DPU_ASSERT(dpu_sync(dpu_set));
             });
-            pim_coverage_timer->end();
-            cpu_coverage_timer->start();
 
+            bool ret = false;
             time_nested("receive", [&]() {
                 receive_task();
                 // always use these two together, sync receive is SYNCHRONOUS
                 ret = sync();
             });
             working_manager = nullptr;
+            return ret;
+        } else {
+            // DPU_ASSERT(dpu_sync(dpu_set));
+            working_manager = nullptr;
+            return false;
         }
-        working_manager = nullptr;
-        time_nested(string("unlock"), [&]() {
-            dpu_control::dpu_mutex.unlock();
-        });
-        return ret;
     }
 };
 
-const int NUM_IO_MANAGERS = 5;
+const int NUM_IO_MANAGERS = 3;
 IO_Manager** io_managers;
+IO_Manager* IO_Manager::working_manager;
 
 inline void init_io_managers() {
     io_managers = new IO_Manager*[NUM_IO_MANAGERS];
-    for (int i = 0; i < NUM_IO_MANAGERS; i++) {
+    for (int i = 0; i < NUM_IO_MANAGERS; i ++) {
         io_managers[i] = new IO_Manager();
-        io_managers[i]->tid = worker_id();
-        io_managers[i]->id = i;
         io_managers[i]->reset();
     }
 }
 
 inline auto alloc_io_manager() {
-    unique_lock wLock(IO_Manager::alloc_io_manager_mutex);
     for (int i = 0; i < NUM_IO_MANAGERS; i++) {
         if (io_managers[i]->io_manager_state == idle) {
-            ASSERT(io_managers[i]->tid == (size_t)-1);
             io_managers[i]->io_manager_state = pre_init;
-            io_managers[i]->tid = worker_id();
             return io_managers[i];
         }
     }

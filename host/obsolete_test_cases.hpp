@@ -121,8 +121,8 @@ void test_task_framework(int dpus) {
     for (int i = 0; i < 1000; i++) {
         time_nested("taskgen", [&]() { taskgen_test(); });
     }
-    print_all_timers(print_type::pt_full);
-    print_all_timers(print_type::pt_time);
+    print_all_timers(timer::print_type::pt_full);
+    print_all_timers(timer::print_type::pt_time);
 }
 
 void test_oracle() {
