@@ -121,6 +121,8 @@ inline void write_ops_to_file(string file_name,
     close(fd);
 }
 
+bool Check_result = false;
+
 template <typename Checker>
 auto read_op_file(string name, Checker checker) {
     const char* filepath = name.c_str();
@@ -256,7 +258,7 @@ void scan(slice<scan_operation*, scan_operation*> ops, unique_lock<mutex>& mut, 
     time_start("scan");
     auto v1 = ds->scan(ops);
     time_end("scan");
-    if (check_result) {
+    if (Check_result) {
         int64_t length = ops.size();
         auto v2 = oracle.scan_size_batch(ops);
         bool correct = true;
@@ -275,8 +277,14 @@ void scan(slice<scan_operation*, scan_operation*> ops, unique_lock<mutex>& mut, 
                 v2l = v2[i].second - v2[i].first;
                 if (v2l != v1l) {
                     if(print_num < 10){
-                        printf("k=(%lld,%lld) v1_s=%lld v2_s=%lld\n",
-                            ops[i].lkey, ops[i].rkey, v1l, v2l);
+                        printf(
+                            "k=(%lld,%lld) v1_s=%lld v2_s=%lld (%lld, %lld; %lld, %lld) (%lld, %lld; %lld, %lld)\n",
+                            ops[i].lkey, ops[i].rkey, v1l, v2l,
+                            v1.first[v1.second[i].first - 1].key, v1.first[v1.second[i].first].key,
+                            v1.first[v1.second[i].second].key, v1.first[v1.second[i].second + 1].key,
+                            oracle.inserted[v2[i].first - 1].key, oracle.inserted[v2[i].first].key,
+                            oracle.inserted[v2[i].second].key, oracle.inserted[v2[i].second + 1].key
+                        );
                         print_num++;
                     }
                     res++;
