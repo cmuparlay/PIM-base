@@ -5,197 +5,127 @@
 #include <parlay/sequence.h>
 #include <cstring>
 #include <vector>
-#include "random_generator.hpp"
+#include <map>
+#include "operation_def.hpp"
 #include "value.hpp"
-using namespace std;
 
-class batch_parallel_oracle {
-    template <class TT>
-    struct copy_scan {
-        using T = TT;
-        copy_scan() : identity((key_value){.key = INT64_MIN, .value = INT64_MIN}) {}
-        T identity;
-        static T f(T a, T b) { return ((b.key == INT64_MIN) && (b.value == INT64_MIN)) ? a : b; }
-    };
+// class batch_parallel_oracle_base {
+//     public:
+//     virtual parlay::sequence<key_value> predecessor_batch(uint64_t* keys, size_t size) = 0;
+//     virtual void insert_batch(insert_operation* insert_ops, size_t size) = 0;
+//     virtual void remove_batch(remove_operation* remove_ops, size_t size) = 0;
+//     virtual parlay::sequence<std::pair<int64_t, int64_t>> scan_size_batch(scan_operation* scan_ops, size_t size) = 0;
+//     virtual parlay::sequence<key_value> dump() = 0;
+//     virtual size_t size() = 0;
+// };
 
-    const int default_batch_size = 1e6;
+class Oracle {
+    public:
+    std::map<int64_t, int64_t> data;
+    std::vector<int64_t> keys;
 
-    using kv_seq = parlay::slice<key_value*, key_value*>;
-    using i64_seq = parlay::slice<int64_t*, int64_t*>;
-
-   public:
-    static size_t kv_seq_find_by_key(const kv_seq& s, const int64_t& key) {
-        int l = 0, r = s.size();
-        while (r - l > 1) {
-            int mid = (l + r) >> 1;
-            if (s[mid].key <= key) {
-                l = mid;
-            } else {
-                r = mid;
-            }
-        }
-        ASSERT(s[l].key <= key);
-        return l;
+    void Init() {
+        data.clear();
+        keys.clear();
+        data[INT64_MIN] = INT64_MIN;
     }
 
-    static key_value kv_seq_find_result_by_key(const kv_seq& s,
-                                               const int64_t& key) {
-        return s[kv_seq_find_by_key(s, key)];
+    key_value Predecessor(int64_t key) {
+        auto itr = data.upper_bound(key);
+        assert(itr != data.begin());
+        itr--;
+        return (key_value)(*itr);
     }
-
-   public:
-    parlay::sequence<key_value> inserted;
-    batch_parallel_oracle() {
-        inserted = parlay::tabulate(1, [](size_t i) {
-            (void)i;
-            return (key_value){.key = INT64_MIN, .value = INT64_MIN};
-        });
-    }
-
-    template <typename kviterator>
-    void init(const parlay::slice<kviterator, kviterator>& kvs) {
-        this->insert_batch(kvs);
-    }
-
-    size_t predecessor_position(const int64_t& v) {
-        return kv_seq_find_by_key(parlay::make_slice(inserted), v);
-    }
-
-    key_value predecessor(const int64_t& v) {
-        return kv_seq_find_result_by_key(parlay::make_slice(inserted), v);
-    }
-
-    template <typename i64iterator>
-    parlay::sequence<key_value> predecessor_batch(
-        const parlay::slice<i64iterator, i64iterator>& buf) {
-        int length = buf.size();
-        // using TT = decltype(buf[0]);
-        // using X = typename TT::nothing;
+    
+    template <typename GetKeyF>
+    std::vector<key_value> RunBatchGet(size_t size, GetKeyF get_key) {
         static_assert(
-            std::is_same<typename std::int64_t&, decltype(buf[0])>::value);
-        return parlay::tabulate(length,
-                                [&](size_t i) { return predecessor(buf[i]); });
-    }
-
-    template <typename i64iterator>
-    auto predecessor_position_batch(
-        const parlay::slice<i64iterator, i64iterator>& buf) {
-        // static_assert(
-        //     std::is_same<typename std::int64_t, decltype(buf[0])>::value);
-        int length = buf.size();
-        return parlay::tabulate(
-            length, [&](size_t i) { return predecessor_position(buf[i]); });
-    }
-
-    template <typename kviterator>
-    void insert_batch(const parlay::slice<kviterator, kviterator>& buffer) {
-        // static_assert(
-        //     std::is_same<typename key_value, decltype(buffer[0])>::value);
-        auto buffer_sorted = parlay::sort(buffer);
-
-        auto buf =
-            parlay::pack(
-                buffer_sorted,
-                parlay::make_slice(parlay::delayed_seq<bool>(buffer_sorted.size(), [&](size_t i) {
-                    return (i == 0) || (buffer_sorted[i].key != buffer_sorted[i - 1].key);
-                })));
-
-        int len = buf.size();
-
-        auto keys = parlay::delayed_seq<int64_t>(
-            len, [&](size_t i) { return buf[i].key; });
-
-        auto results = predecessor_position_batch(parlay::make_slice(keys));
-        parlay::parallel_for(0, len, [&](size_t i) {
-            if (buf[i].key == inserted[results[i]].key) {
-                inserted[results[i]].value = buf[i].value;
+            std::is_same<int64_t, decltype(get_key(0))>::value, "get_key(0) must return int64_t");
+        std::vector<key_value> ret(size);
+        parlay::parallel_for(0, size, [&](size_t i) {
+            int64_t key = get_key(i);
+            auto itr = data.find(key);
+            if (itr != data.end()) {
+                ret[i] = (key_value)(*itr);
+            } else {
+                ret[i] = (key_value)(INT64_MIN, INT64_MIN);
             }
         });
-        inserted = parlay::unique(parlay::merge(inserted, buf));
+        return ret;
     }
 
-    template <typename i64iterator>
-    void remove_batch(const parlay::slice<i64iterator, i64iterator>& buffer) {
-        auto keys = parlay::sort(buffer);
-        int len = keys.size();
-        auto results = predecessor_position_batch(parlay::make_slice(keys));
-        parlay::parallel_for(0, len, [&](size_t i) {
-            if (keys[i] == inserted[results[i]].key) {
-                inserted[results[i]] =
-                    (key_value){.key = INT64_MIN, .value = INT64_MIN};
+    template<typename GetKeyF>
+    std::vector<key_value> RunBatchPredecessor(size_t size, GetKeyF get_key) {
+        static_assert(
+            std::is_same<int64_t, decltype(get_key(0))>::value, "get_key(0) must return int64_t");
+
+        std::vector<key_value> ret(size);
+        parlay::parallel_for(0, size, [&](size_t i) {
+            auto itr = data.upper_bound(get_key(i));
+            itr--;
+            ret[i] = (key_value)(*itr);
+        });
+        return ret;
+    }
+
+    template<typename GetKVF>
+    void RunBatchInsert(size_t size, GetKVF get_kv) {
+        static_assert(
+            std::is_same<key_value, decltype(get_kv(0))>::value, "get_kv(0) must return key_value");
+        std::vector<key_value> kvs(size);
+        parlay::parallel_for(0, size, [&](size_t i) {
+            kvs[i] = get_kv(i);
+        });
+        parlay::sort_inplace(kvs);
+        for (size_t i = 0; i < size; i++) {
+            key_value kv = kvs[i];
+            if (i > 0 && kvs[i - 1].key == kv.key) {
+                continue;
+            } else {
+                data[kv.key] = kv.value;
+            }
+        }
+    }
+
+    template<typename GetKeyF>
+    void RunBatchRemove(size_t size, GetKeyF get_key) {
+        static_assert(
+            std::is_same<int64_t, decltype(get_key(0))>::value, "get_key(0) must return int64_t");
+        for (size_t i = 0; i < size; i++) {
+            int64_t key = get_key(i);
+            auto itr = data.find(key);
+            if (itr != data.end()) {
+                data.erase(itr);
+            }
+        }
+    }
+
+    template<typename GetLRKeyF>
+    std::vector<std::vector<key_value>> RunBatchScan(size_t size, GetLRKeyF get_lrkey) {
+        std::vector<std::vector<key_value>> ret(size);
+        parlay::parallel_for(0, size, [&](size_t i) {
+            int64_t lkey, rkey;
+            std::tie(lkey, rkey) = get_lrkey(i);
+            auto lpos = data.lower_bound(lkey);
+            auto rpos = data.upper_bound(rkey);
+            for (auto itr = lpos; itr != rpos; itr++) {
+                ret[i].push_back((key_value)(*itr));
             }
         });
-        inserted = parlay::unique(parlay::scan_inclusive(inserted, copy_scan<key_value>()));
+        return ret;
     }
 
-    key_value random_element() {
-        int j = abs(rn_gen::parallel_rand()) % inserted.size();
-        return inserted[j];
+    size_t Size() {
+        return data.size();
     }
 
-    // Range Scan
-    template <class SS, class T>
-    auto scan_size(const SS& s, T& op) {
-        int64_t lkey = op.lkey, rkey = op.rkey;
-        int64_t l = 0, r = s.size();
-        int64_t mid;
-        while (r - l > 1) {
-            mid = (l + r) >> 1;
-            if (s[mid].key <= lkey) {
-                l = mid;
-            } else if (s[mid].key > rkey) {
-                r = mid;
-            } else {
-                break;
-            }
+    std::vector<key_value> Dump() {
+        size_t cnt = 0;
+        size_t size = data.size();
+        std::vector<key_value> ret(size);
+        for (auto itr = data.begin(); itr != data.end(); itr++) {
+            ret[cnt++] = (key_value)(*itr);
         }
-        int64_t rr = r, mm = mid;
-        r = mid;
-        while (r - l > 1) {
-            mid = (l + r) >> 1;
-            if (s[mid].key > lkey) {
-                r = mid;
-            } else {
-                l = mid;
-            }
-        }
-        if (lkey > s[l].key) l++;
-        while (rr - mm > 1) {
-            mid = (rr + mm) >> 1;
-            if (s[mid].key > rkey) {
-                rr = mid;
-            } else {
-                mm = mid;
-            }
-        }
-        if (mm >= s.size() - 1)
-            mm = s.size();
-        else if (s[mm + 1].key <= rkey)
-            mm += 2;
-        else
-            mm++;
-        if(l == mm || l + 1 == mm) {
-            if(s[l].key >= lkey && s[l].key <= rkey)
-                mm = l + 1;
-            else
-                mm = l;
-        }
-        return std::make_pair(l, mm);
-    }
-
-    template <class T>
-    auto scan_size_batch(slice<T*, T*>& ops) {
-        parlay::sort_inplace(
-            inserted, [&](key_value kv1, key_value kv2) -> bool {
-                return (kv1.key < kv2.key) ||
-                       ((kv1.key == kv2.key) && (kv1.value < kv2.value));
-            });
-        auto inserted_set =
-            parlay::unique(inserted, [&](key_value kv1, key_value kv2) -> bool {
-                return (kv1.key == kv2.key);
-            });
-        return parlay::tabulate(ops.size(), [&](int64_t i) {
-            return scan_size(inserted_set, ops[i]);
-        });
+        return ret;
     }
 };

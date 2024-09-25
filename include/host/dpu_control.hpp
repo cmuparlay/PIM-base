@@ -1,6 +1,10 @@
 #pragma once
+#include <iostream>
 #include <string>
 #include <mutex>
+#include "debug.hpp"
+#include "pim_interface_header.hpp"
+
 using namespace std;
 
 extern "C" {
@@ -30,6 +34,7 @@ void alloc(int count) {
 
 void load(string binary) {
     DPU_ASSERT(dpu_load(dpu_set, binary.c_str(), NULL));
+    namespace_pim_interface::load_from_dpu_set(dpu_set);
 }
 
 template <typename F>

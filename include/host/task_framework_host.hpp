@@ -7,6 +7,8 @@
 #include "sort.hpp"
 #include "task_framework_common.h"
 
+#include "pim_interface_header.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -19,12 +21,15 @@
 #include <parlay/primitives.h>
 #include <parlay/internal/integer_sort.h>
 #include <parlay/papi/papi_util_impl.h>
+#include <parlay/parallel.h>
+#include <parlay/internal/sequence_ops.h>
 #include <mutex>
 
 #define SEND_RECEIVE_ASYNC_STATE (DPU_XFER_DEFAULT)
 
 // IRAM friendly
 using namespace std;
+using namespace parlay;
 
 atomic<uint64_t> total_communication = 0;
 atomic<uint64_t> total_actual_communication = 0;
@@ -166,19 +171,19 @@ class IO_Task_Block {
         int _cnt = (int)(this->base64[1]);
         int _size = (int)(this->base64[2]);
         count_size send_cs = cs.load();
-#ifdef KHB_CPU_DEBUG
+#ifdef ZHAOYW_CPU_DEBUG
         if (!(_cnt == send_cs.cnt)) {
             printf("wrong %d %d\n", _cnt, send_cs.cnt);
             fflush(stdout);
         }
 #endif
         ASSERT(_cnt == send_cs.cnt);
-        cs = (count_size){.cnt = _cnt, .size = _size};
         if (_ct == fixed_length) {
             this->task_length = length;
         } else {
             this->offsets = (int64_t*)(base + _size - _cnt * sizeof(int64_t));
         }
+        cs = (count_size){.cnt = _cnt, .size = _size};
     }
 
     void* ith(int i) {
@@ -193,6 +198,7 @@ class IO_Task_Block {
             ret = base + i;
         } else {
             ret = base + offsets[i];
+            ASSERT(offsets[i] < cs.load().size);
         }
         return ret;
     }
@@ -222,7 +228,7 @@ class IO_Task_Batch {
         btt = _btt;
         ct = _ct;
         task_length = length;
-#ifdef KHB_CPU_DEBUG
+#ifdef ZHAOYW_CPU_DEBUG
         if (btt == broadcast) {
             ASSERT(ct == fixed_length);
         }
@@ -235,12 +241,11 @@ class IO_Task_Batch {
         if (btt == broadcast) {
             tbs[0].init(ct, task_type, _bases[0], offset_bufs[0], length, 0);
         } else {
+            // for (int i = 0; i < nr_of_dpus; i++) {
             parlay::parallel_for(0, nr_of_dpus, [&](size_t i) {
-                // for (int i = 0; i < nr_of_dpus; i++) {
-                tbs[i].init(ct, task_type, _bases[i], offset_bufs[i], length,
-                            i);
-                // }
+                tbs[i].init(ct, task_type, _bases[i], offset_bufs[i], length, i);
             });
+            // }
         }
     }
 
@@ -266,8 +271,7 @@ class IO_Task_Batch {
             ASSERT(counts[i] < MAX_TASK_COUNT_PER_DPU_PER_BLOCK);
             tbs[i].cs = (count_size){
                 .cnt = (int)counts[i],
-                .size =
-                    (int)(CPU_DPU_BLOCK_HEADER + counts[i] * sizeof(TaskType))};
+                .size = (int)(CPU_DPU_BLOCK_HEADER + counts[i] * sizeof(TaskType))};
         });
         return;
     }
@@ -307,8 +311,7 @@ class IO_Task_Batch {
             });
             tbs[i].cs = (count_size){
                 .cnt = (int)counts[i],
-                .size =
-                    (int)(CPU_DPU_BLOCK_HEADER + counts[i] * sizeof(TaskType))};
+                .size = (int)(CPU_DPU_BLOCK_HEADER + counts[i] * sizeof(TaskType))};
         });
         return;
     }
@@ -331,7 +334,7 @@ class IO_Task_Batch {
     void* push_task_zero_copy(int send_id, int length, bool atomic,
                               int* cnt = nullptr) {
         ASSERT(state == loading_tasks);
-#ifdef KHB_CPU_DEBUG
+#ifdef ZHAOYW_CPU_DEBUG
         if (btt == broadcast) {
             ASSERT(send_id == -1);
         } else {
@@ -349,7 +352,7 @@ class IO_Task_Batch {
                                         bool atomic, int* cnt = nullptr) {
         ASSERT(state == loading_tasks);
         // ASSERT(ct == fixed_length);
-#ifdef KHB_CPU_DEBUG
+#ifdef ZHAOYW_CPU_DEBUG
         if (btt == broadcast) {
             ASSERT(send_id == -1);
         } else {
@@ -360,8 +363,7 @@ class IO_Task_Batch {
         if (btt == broadcast) {
             send_id = 0;
         }
-        return tbs[send_id].push_multiple_tasks_zero_copy(length, count, atomic,
-                                                          cnt);
+        return tbs[send_id].push_multiple_tasks_zero_copy(length, count, atomic, cnt);
     }
 
     bool finish(uint8_t** starts) {
@@ -400,7 +402,7 @@ class IO_Task_Batch {
     }
 
     void* ith(int receive_id, int offset) {
-#ifdef KHB_CPU_DEBUG
+#ifdef ZHAOYW_CPU_DEBUG
         if (btt == broadcast) {
             ASSERT(receive_id == -1);
         } else {
@@ -428,8 +430,9 @@ class IO_Manager {
     // memory buffers
     int64_t direct_offsets[NR_DPUS][MAX_TASK_COUNT_PER_DPU_PER_BLOCK];
     uint8_t (*direct_buffer)[MAX_TASK_BUFFER_SIZE_PER_DPU];
+    uint8_t* direct_buffer_addr[NR_DPUS];
     uint8_t* direct_buffer_heads[NR_DPUS];
-    uint8_t* direct_buffer_tails[NR_DPUS];
+    // uint8_t* direct_buffer_tails[NR_DPUS];
     int64_t direct_batch_offsets[NR_DPUS][MAX_IO_BLOCKS];
     int direct_receive_length[NR_DPUS];  // expected receive length
 
@@ -444,15 +447,14 @@ class IO_Manager {
    public:
     size_t tid; // the worker id of the controlling thread
     int id; // the id of this io manager
-    inline static mutex alloc_io_manager_mutex;
-    inline static atomic<IO_Manager*> working_manager;
+    static mutex alloc_io_manager_mutex;
+    static atomic<IO_Manager*> working_manager;
     State io_manager_state;
     IO_Task_Batch tbs[MAX_IO_BLOCKS];
 
     IO_Manager() {
         direct_buffer = new uint8_t[NR_DPUS][MAX_TASK_BUFFER_SIZE_PER_DPU];
-        memset(direct_buffer, 0,
-               sizeof(uint8_t) * NR_DPUS * MAX_TASK_BUFFER_SIZE_PER_DPU);
+        memset(direct_buffer, 0, sizeof(uint8_t) * NR_DPUS * MAX_TASK_BUFFER_SIZE_PER_DPU);
     }
 
     void reset() {
@@ -470,11 +472,14 @@ class IO_Manager {
         broadcast_buffer_head[0] = broadcast_buffer[0] + CPU_DPU_HEADER;
         broadcast_receive_length[0] = 0;
         broadcast_batch_offsets[0][0] = CPU_DPU_HEADER;
-        for (int i = 0; i < nr_of_dpus; i++) {
+        // for (int i = 0; i < nr_of_dpus; i++) {
+        parlay::parallel_for(0, nr_of_dpus, [&](int i) {
             direct_receive_length[i] = 0;
+            direct_buffer_addr[i] = direct_buffer[i];
             direct_buffer_heads[i] = direct_buffer[i] + CPU_DPU_HEADER;
             direct_batch_offsets[i][0] = CPU_DPU_HEADER;
-        }
+        });
+        // }
         io_manager_state = loading_finished;
     }
 
@@ -494,18 +499,15 @@ class IO_Manager {
             ASSERT(send_ct == fixed_length);
             broadcast_cnt++;
             if (send_ct == fixed_length) {
-                tb.init(btt, send_ct, task_type, broadcast_buffer_head, NULL,
-                        len);
+                tb.init(btt, send_ct, task_type, broadcast_buffer_head, NULL, len);
             }
         } else {
             direct_cnt++;
             if (send_ct == fixed_length) {
-                tb.init(btt, send_ct, task_type, direct_buffer_heads, NULL,
-                        len);
+                tb.init(btt, send_ct, task_type, direct_buffer_heads, NULL, len);
             } else {
                 ASSERT(len == -1);
-                tb.init(btt, send_ct, task_type, direct_buffer_heads,
-                        direct_offsets, -1);
+                tb.init(btt, send_ct, task_type, direct_buffer_heads, direct_offsets, -1);
             }
         }
         io_manager_state = loading_tasks;
@@ -516,15 +518,12 @@ class IO_Manager {
     template <typename Task, typename Reply>
     IO_Task_Batch* alloc(Batch_Transmit_Type btt) {
         ASSERT(tid == worker_id());
-        Block_Content_Type send_ct =
-            Task::fixed ? fixed_length : variable_length;
-        Block_Content_Type receive_ct =
-            Reply::fixed ? fixed_length : variable_length;
+        Block_Content_Type send_ct = Task::fixed ? fixed_length : variable_length;
+        Block_Content_Type receive_ct = Reply::fixed ? fixed_length : variable_length;
         int task_type = Task::id;
         int len = Task::task_len;
         int reply_len = Reply::task_len;
-        return alloc_task_batch(btt, send_ct, receive_ct, task_type, len,
-                                reply_len);
+        return alloc_task_batch(btt, send_ct, receive_ct, task_type, len, reply_len);
     }
 
     void finish_task_batch() {
@@ -534,17 +533,13 @@ class IO_Manager {
         ASSERT(tbs[i].state == loading_tasks);
         if (tbs[i].btt == broadcast) {
             tbs[i].finish(broadcast_buffer_head);
-            broadcast_batch_offsets[0][broadcast_cnt] =
-                broadcast_buffer_head[0] - broadcast_buffer[0];
-            ASSERT((broadcast_buffer_head[0] - broadcast_buffer[0]) <
-                   MAX_TASK_BUFFER_SIZE_PER_DPU);
+            broadcast_batch_offsets[0][broadcast_cnt] = broadcast_buffer_head[0] - broadcast_buffer[0];
+            ASSERT((broadcast_buffer_head[0] - broadcast_buffer[0]) < MAX_TASK_BUFFER_SIZE_PER_DPU);
         } else {
             tbs[i].finish(direct_buffer_heads);
             for (int j = 0; j < nr_of_dpus; j++) {
-                direct_batch_offsets[j][direct_cnt] =
-                    direct_buffer_heads[j] - direct_buffer[j];
-                ASSERT((direct_buffer_heads[j] - direct_buffer[j]) <
-                       MAX_TASK_BUFFER_SIZE_PER_DPU);
+                direct_batch_offsets[j][direct_cnt] = direct_buffer_heads[j] - direct_buffer[j];
+                ASSERT((direct_buffer_heads[j] - direct_buffer[j]) < MAX_TASK_BUFFER_SIZE_PER_DPU);
             }
         }
         io_manager_state = loading_finished;
@@ -552,8 +547,7 @@ class IO_Manager {
     }
 
     void print_all_buffer(bool x16 = false) {
-        bool sending = (io_manager_state == loading_tasks ||
-                        io_manager_state == loading_finished);
+        bool sending = (io_manager_state == loading_tasks || io_manager_state == loading_finished);
         ASSERT(tid == worker_id());
         if (sending) {
             if (direct_cnt > 0) {
@@ -619,94 +613,81 @@ class IO_Manager {
         ASSERT(cnt > 0 && tbs[cnt - 1].state == loading_finished);
         ASSERT((direct_cnt > 0) || (broadcast_cnt > 0));
 
-        time_start("pre send");
-
-        // calculate reply length
-        broadcast_receive_length[0] = 0;
-        memset(direct_receive_length, 0, sizeof(direct_receive_length));
-        {
-            for (int i = 0; i < cnt; i++) {
-                if (tbs[i].btt == broadcast) {
-                    tbs[i].expected_reply_length(broadcast_receive_length,
-                                                 reply_length[i], fixed_length);
-                } else {
-                    tbs[i].expected_reply_length(direct_receive_length,
-                                                 reply_length[i], reply_ct[i]);
-                }
-            }
-        }
-
-        int broadcast_length =
-            broadcast_buffer_head[0] - broadcast_buffer[0] - CPU_DPU_HEADER;
-        int cnt_length = sizeof(int64_t) * cnt;
-
-        auto get_direct_size = [&]() -> int {
-            if (direct_cnt == 0) {
-                return 0;
-            }
-            int ret = 0;
-            for (int i = 0; i < nr_of_dpus; i++) {
-                int64_t* start = (int64_t*)direct_buffer[i];
-                int task_size =
-                    direct_buffer_heads[i] - direct_buffer[i] - CPU_DPU_HEADER;
-                int size =
-                    CPU_DPU_HEADER + broadcast_length + task_size + cnt_length;
-                ret = max(ret, task_size);
-                start[0] = epoch_number;
-                start[1] = cnt;
-                start[2] = size;
-                ASSERT(size <= MAX_TASK_BUFFER_SIZE_PER_DPU);
-                if (broadcast_cnt > 0) {
-                    memcpy(direct_buffer_heads[i], broadcast_batch_offsets[0],
-                           sizeof(int64_t) * broadcast_cnt);
-                    for (int j = 0; j < direct_cnt; j++) {
-                        direct_batch_offsets[i][j] += broadcast_length;
+        int broadcast_length, cnt_length, direct_length;
+        time_nested("pre send", [&]() {
+            // calculate reply length
+            broadcast_receive_length[0] = 0;
+            memset(direct_receive_length, 0, sizeof(direct_receive_length));
+            {
+                for (int i = 0; i < cnt; i++) {
+                    if (tbs[i].btt == broadcast) {
+                        tbs[i].expected_reply_length(broadcast_receive_length, reply_length[i], fixed_length);
+                    } else {
+                        tbs[i].expected_reply_length(direct_receive_length, reply_length[i], reply_ct[i]);
                     }
                 }
-                memcpy(direct_buffer_heads[i] + sizeof(int64_t) * broadcast_cnt,
-                       direct_batch_offsets[i], sizeof(int64_t) * direct_cnt);
             }
-            return ret;
-        };
 
-        int direct_length = get_direct_size();
+            broadcast_length = broadcast_buffer_head[0] - broadcast_buffer[0] - CPU_DPU_HEADER;
+            cnt_length = sizeof(int64_t) * cnt;
 
-        time_end("pre send");
+            auto get_direct_size = [&]() -> int {
+                if (direct_cnt == 0) {
+                    return 0;
+                }
+                // for (int i = 0; i < nr_of_dpus; i++) {
+                auto ret_seq = parlay::tabulate(nr_of_dpus, [&](int i) {
+                    int64_t* start = (int64_t*)direct_buffer[i];
+                    int task_size = direct_buffer_heads[i] - direct_buffer[i] - CPU_DPU_HEADER;
+                    int size = CPU_DPU_HEADER + broadcast_length + task_size + cnt_length;
+                    // ret = max(ret, task_size);
+                    start[0] = epoch_number;
+                    start[1] = cnt;
+                    start[2] = size;
+                    ASSERT(size <= MAX_TASK_BUFFER_SIZE_PER_DPU);
+                    if (broadcast_cnt > 0) {
+                        memcpy(direct_buffer_heads[i], broadcast_batch_offsets[0],
+                            sizeof(int64_t) * broadcast_cnt);
+                        for (int j = 0; j < direct_cnt; j++) {
+                            direct_batch_offsets[i][j] += broadcast_length;
+                        }
+                    }
+                    memcpy(direct_buffer_heads[i] + sizeof(int64_t) * broadcast_cnt,
+                        direct_batch_offsets[i], sizeof(int64_t) * direct_cnt);
+                    return task_size;
+                });
+                // }
+                int ret = *(parlay::max_element(ret_seq));
+                return ret;
+            };
+            direct_length = get_direct_size();
+        });
 
 #ifdef INFO_IO_BALANCE
-        {
-            int size_sum = 0, size_max = 0;
-            auto get_size_sum = [&](int& size_sum, int& size_max) -> void {
-                if (direct_cnt == 0) {
-                    size_sum =
-                        (CPU_DPU_HEADER + broadcast_length + cnt_length) *
-                        nr_of_dpus;
-                    size_max = CPU_DPU_HEADER + broadcast_length + cnt_length;
-                } else {
-                    for (int i = 0; i < nr_of_dpus; i++) {
-                        int64_t* start = (int64_t*)direct_buffer[i];
-                        size_sum += start[2];
-                        size_max = (size_max > start[2]) ? size_max : start[2];
-                    }
+        int size_sum = 0, size_max = 0;
+        auto get_size_sum = [&](int& size_sum, int& size_max) -> void {
+            if (direct_cnt == 0) {
+                size_sum = (CPU_DPU_HEADER + broadcast_length + cnt_length) * nr_of_dpus;
+                size_max = CPU_DPU_HEADER + broadcast_length + cnt_length;
+            } else {
+                for (int i = 0; i < nr_of_dpus; i++) {
+                    int64_t* start = (int64_t*)direct_buffer[i];
+                    size_sum += start[2];
+                    size_max = (size_max > start[2]) ? size_max : start[2];
                 }
-            };
-            get_size_sum(size_sum, size_max);
+            }
+        };
+        get_size_sum(size_sum, size_max);
 
-            total_communication += size_sum;
-            total_actual_communication +=
-                (uint64_t)size_max * (uint64_t)nr_of_dpus;
-
-#ifdef PRINT_IO
-            printf(
-                "send %d : dircnt=%d broadcnt=%d sum=%d max=%d"
-                "ratio=%lf\n",
-                epoch_number, direct_cnt, broadcast_cnt, size_sum, size_max,
-                ((double)size_sum / size_max) / nr_of_dpus);
-#endif
-        }
+        total_communication += size_sum;
+        total_actual_communication += (uint64_t)size_max * (uint64_t)nr_of_dpus;
 #endif
 
         parlay::deactivate_scheduling(true);
+
+#if defined(INFO_IO_BALANCE) && defined(PRINT_IO)
+        auto start_time = std::chrono::high_resolution_clock::now();
+#endif
 
         time_nested("trigger", [&]() {
             if (direct_cnt == 0) {
@@ -724,55 +705,83 @@ class IO_Manager {
                                             broadcast_buffer[0], size,
                                             SEND_RECEIVE_ASYNC_STATE));
 #else
-            DPU_ASSERT(dpu_broadcast_to(dpu_set, DPU_MRAM_HEAP_POINTER_NAME, 0,
+                DPU_ASSERT(dpu_broadcast_to(dpu_set, DPU_MRAM_HEAP_POINTER_NAME, 0,
                                         broadcast_buffer[0], size,
                                         SEND_RECEIVE_ASYNC_STATE));
 #endif
             } else if (broadcast_cnt == 0) {
                 ASSERT(broadcast_length == 0);
-                int size = CPU_DPU_HEADER + broadcast_length + direct_length +
-                           cnt_length;
-                DPU_FOREACH(dpu_set, dpu, each_dpu) {
-                    DPU_ASSERT(dpu_prepare_xfer(dpu, direct_buffer[each_dpu]));
-                }
+                int size = CPU_DPU_HEADER + broadcast_length + direct_length + cnt_length;
+                // DPU_FOREACH(dpu_set, dpu, each_dpu) {
+                //     DPU_ASSERT(dpu_prepare_xfer(dpu, direct_buffer[each_dpu]));
+                // }
 #ifdef IRAM_FRIENDLY
-                DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
-                                         DPU_MRAM_HEAP_POINTER_NAME,
-                                         DPU_MRAM_HEAP_START_SAFE_BUFFER, size,
-                                         SEND_RECEIVE_ASYNC_STATE));
+                // DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
+                //                          DPU_MRAM_HEAP_POINTER_NAME,
+                //                          DPU_MRAM_HEAP_START_SAFE_BUFFER, size,
+                //                          SEND_RECEIVE_ASYNC_STATE));
+                namespace_pim_interface::SendToPIM(
+                    (uint8_t**)direct_buffer_addr, 0, DPU_MRAM_HEAP_POINTER_NAME, DPU_MRAM_HEAP_START_SAFE_BUFFER,
+                    size, false
+                );
 #else
-            DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
-                                     DPU_MRAM_HEAP_POINTER_NAME, 0, size,
-                                     SEND_RECEIVE_ASYNC_STATE));
+                // DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
+                //                      DPU_MRAM_HEAP_POINTER_NAME, 0, size,
+                //                      SEND_RECEIVE_ASYNC_STATE));
+                namespace_pim_interface::SendToPIM(
+                    (uint8_t**)direct_buffer_addr, 0, DPU_MRAM_HEAP_POINTER_NAME, 0,
+                    size, false
+                );
 #endif
             } else {  // both
                 // header
-                DPU_FOREACH(dpu_set, dpu, each_dpu) {
-                    DPU_ASSERT(dpu_prepare_xfer(dpu, direct_buffer[each_dpu]));
-                }
-                DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
-                                         DPU_MRAM_HEAP_POINTER_NAME,
-                                         DPU_MRAM_HEAP_START_SAFE_BUFFER,
-                                         CPU_DPU_HEADER, DPU_XFER_ASYNC));
+                // DPU_FOREACH(dpu_set, dpu, each_dpu) {
+                //     DPU_ASSERT(dpu_prepare_xfer(dpu, direct_buffer[each_dpu]));
+                // }
+                // DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
+                //                          DPU_MRAM_HEAP_POINTER_NAME,
+                //                          DPU_MRAM_HEAP_START_SAFE_BUFFER,
+                //                          CPU_DPU_HEADER, DPU_XFER_ASYNC));
+                namespace_pim_interface::SendToPIM(
+                    (uint8_t**)direct_buffer_addr, 0, DPU_MRAM_HEAP_POINTER_NAME,
+                    DPU_MRAM_HEAP_START_SAFE_BUFFER,
+                    CPU_DPU_HEADER, false 
+                );
                 // broadcast
                 DPU_ASSERT(dpu_broadcast_to(
                     dpu_set, DPU_MRAM_HEAP_POINTER_NAME,
                     CPU_DPU_HEADER + DPU_MRAM_HEAP_START_SAFE_BUFFER,
                     broadcast_buffer[0] + CPU_DPU_HEADER, broadcast_length,
-                    DPU_XFER_ASYNC));
+                    SEND_RECEIVE_ASYNC_STATE));
 
                 // direct
-                DPU_FOREACH(dpu_set, dpu, each_dpu) {
-                    DPU_ASSERT(dpu_prepare_xfer(
-                        dpu, direct_buffer[each_dpu] + CPU_DPU_HEADER));
-                }
-                DPU_ASSERT(dpu_push_xfer(
-                    dpu_set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME,
-                    CPU_DPU_HEADER + broadcast_length +
-                        DPU_MRAM_HEAP_START_SAFE_BUFFER,
-                    direct_length + cnt_length, SEND_RECEIVE_ASYNC_STATE));
+                // DPU_FOREACH(dpu_set, dpu, each_dpu) {
+                //     DPU_ASSERT(dpu_prepare_xfer(
+                //         dpu, direct_buffer[each_dpu] + CPU_DPU_HEADER));
+                // }
+                // DPU_ASSERT(dpu_push_xfer(
+                //     dpu_set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME,
+                //     CPU_DPU_HEADER + broadcast_length +
+                //         DPU_MRAM_HEAP_START_SAFE_BUFFER,
+                //     direct_length + cnt_length, SEND_RECEIVE_ASYNC_STATE));
+                namespace_pim_interface::SendToPIM(
+                    (uint8_t**)direct_buffer_addr, CPU_DPU_HEADER, DPU_MRAM_HEAP_POINTER_NAME,
+                    CPU_DPU_HEADER + broadcast_length + DPU_MRAM_HEAP_START_SAFE_BUFFER,
+                    direct_length + cnt_length, false
+                );
             }
         });
+
+
+#if defined(INFO_IO_BALANCE) && defined(PRINT_IO)
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto d = std::chrono::duration_cast<std::chrono::duration<double>>(end_time - start_time).count();
+        printf(
+            "send    %5d : sum=%5lfMB total=%5lfMB "
+            "amplification=%8lf time=%5lf bandwidth=%5lfGB/s\n",
+            epoch_number, (double)size_sum / 1024 / 1024, (double)size_max * nr_of_dpus / 1024 / 1024,
+            (double)size_max * nr_of_dpus / size_sum, d, size_sum, (double)size_max * nr_of_dpus / d / 1024 / 1024 / 1024);
+#endif
 
         parlay::deactivate_scheduling(false);
 
@@ -781,26 +790,35 @@ class IO_Manager {
     }
 
     auto direct_receive_maxlen() {
-        auto lengths = parlay::make_slice(direct_receive_length,
-                                          direct_receive_length + nr_of_dpus);
+        auto lengths = parlay::make_slice(direct_receive_length, direct_receive_length + nr_of_dpus);
         auto maxele = parlay::max_element(lengths);
         return *maxele;
     }
 
     void receive_from_direct(int offset, int length) {
-        DPU_FOREACH(dpu_set, dpu, each_dpu) {
-            DPU_ASSERT(dpu_prepare_xfer(dpu, direct_buffer[each_dpu] + offset));
-        }
+        // DPU_FOREACH(dpu_set, dpu, each_dpu) {
+        //     DPU_ASSERT(dpu_prepare_xfer(dpu, direct_buffer[each_dpu] + offset));
+        // }
 #ifdef IRAM_FRIENDLY
-        DPU_ASSERT(dpu_push_xfer(
-            dpu_set, DPU_XFER_FROM_DPU, DPU_MRAM_HEAP_POINTER_NAME,
+        // DPU_ASSERT(dpu_push_xfer(
+        //     dpu_set, DPU_XFER_FROM_DPU, DPU_MRAM_HEAP_POINTER_NAME,
+        //     DPU_SEND_BUFFER_OFFSET + offset + DPU_MRAM_HEAP_START_SAFE_BUFFER,
+        //     length, SEND_RECEIVE_ASYNC_STATE));
+        namespace_pim_interface::ReceiveFromPIM(
+            (uint8_t**)direct_buffer_addr, offset, DPU_MRAM_HEAP_POINTER_NAME,
             DPU_SEND_BUFFER_OFFSET + offset + DPU_MRAM_HEAP_START_SAFE_BUFFER,
-            length, SEND_RECEIVE_ASYNC_STATE));
+            length, false
+        );
 
 #else
-        DPU_ASSERT(dpu_push_xfer(
-            dpu_set, DPU_XFER_FROM_DPU, DPU_MRAM_HEAP_POINTER_NAME,
-            DPU_SEND_BUFFER_OFFSET + offset, length, SEND_RECEIVE_ASYNC_STATE));
+        // DPU_ASSERT(dpu_push_xfer(
+        //     dpu_set, DPU_XFER_FROM_DPU, DPU_MRAM_HEAP_POINTER_NAME,
+        //     DPU_SEND_BUFFER_OFFSET + offset, length, SEND_RECEIVE_ASYNC_STATE));
+        namespace_pim_interface::ReceiveFromPIM(
+            (uint8_t**)direct_buffer_addr, offset, DPU_MRAM_HEAP_POINTER_NAME,
+            DPU_SEND_BUFFER_OFFSET + offset,
+            length, false
+        );
 #endif
     }
 
@@ -821,29 +839,35 @@ class IO_Manager {
         }
     }
 
+    std::chrono::time_point<std::chrono::high_resolution_clock> receive_start_time;
+
     bool receive_task() {
-        time_start("pre_working");
         ASSERT(tid == worker_id());
         ASSERT(io_manager_state == loading_finished);
 
         int cnt_length = (sizeof(int64_t) + DPU_CPU_BLOCK_HEADER) * cnt;
 
         int broadcast_length = broadcast_receive_length[0];
-        int direct_length = direct_receive_maxlen();
+        int direct_length;
+        time_nested("pre receive", [&]() {
+            direct_length = direct_receive_maxlen();
+        });
         int receive_length =
             DPU_CPU_HEADER + broadcast_length + direct_length + cnt_length;
 
         ASSERT(broadcast_cnt != 0 || broadcast_length == 0);
         ASSERT(direct_cnt != 0 || direct_length == 0);
-        time_end("pre_working");
 
-#ifndef KHB_CPU_DEBUG
+#ifndef ZHAOYW_CPU_DEBUG
         if ((broadcast_length + direct_length) == 0) {
             io_manager_state = waiting_for_sync;
             return false;
         }
 #endif
 
+#if defined(INFO_IO_BALANCE) && defined(PRINT_IO)
+        receive_start_time = std::chrono::high_resolution_clock::now();
+#endif
         parlay::deactivate_scheduling(true);
         time_nested("trigger", [&]() {
             if (direct_cnt == 0) {  // only broadcast, one DPU_CPU_HEADER
@@ -871,8 +895,7 @@ class IO_Manager {
             for (int i = 0; i < r; i++) {
                 int64_t* buf = (int64_t*)direct_buffer[i];
                 if (buf[0] == DPU_BUFFER_ERROR) {  // error
-                    dpu_control::print_log(
-                        [&](auto x) -> bool { return x == i; });
+                    dpu_control::print_log([&](auto x) -> bool { return x == i; });
                     cout << "Quit From DPU!" << endl;
                     fail = true;
                     break;
@@ -897,24 +920,20 @@ class IO_Manager {
             }
             ASSERT(exact_length < MAX_TASK_BUFFER_SIZE_PER_DPU);
             if (exact_length > receive_length) {
-                receive_from_direct(receive_length,
-                                    exact_length - receive_length);
-                DPU_ASSERT(dpu_sync(dpu_set));
+                receive_from_direct(receive_length, exact_length - receive_length);
             } else {
             }
         };
 
-        time_nested("wait", [&]() { DPU_ASSERT(dpu_sync(dpu_set)); });
         parlay::deactivate_scheduling(false);
 
-        int receive_length =
-            DPU_CPU_HEADER + (sizeof(int64_t) + DPU_CPU_BLOCK_HEADER) * cnt;
+        int receive_length = DPU_CPU_HEADER + (sizeof(int64_t) + DPU_CPU_BLOCK_HEADER) * cnt;
 
         int broadcast_length = broadcast_receive_length[0];
         int direct_length = direct_receive_maxlen();
         receive_length += broadcast_length + direct_length;
 
-#ifdef KHB_CPU_DEBUG
+#ifdef ZHAOYW_CPU_DEBUG
         check_error();
         if ((broadcast_length + direct_length) == 0) {
             return quit();
@@ -926,31 +945,23 @@ class IO_Manager {
 #endif
 
 #ifdef INFO_IO_BALANCE
-        time_nested("io count", [&](){
-            int size_sum = 0, size_max = 0;
-            auto get_size_sum = [&](int& size_sum, int& size_max) -> void {
-                if (direct_cnt == 0) {
-                    int64_t* start = (int64_t*)direct_buffer[0];
-                    size_sum = start[2] * nr_of_dpus;
-                    size_max = start[2];
-                } else {
-                    for (int i = 0; i < nr_of_dpus; i++) {
-                        int64_t* start = (int64_t*)direct_buffer[i];
-                        size_sum += start[2];
-                        size_max = (size_max > start[2]) ? size_max : start[2];
-                    }
+        int size_sum = 0, size_max = 0;
+        auto get_size_sum = [&](int& size_sum, int& size_max) -> void {
+            if (direct_cnt == 0) {
+                int64_t* start = (int64_t*)direct_buffer[0];
+                size_sum = start[2] * nr_of_dpus;
+                size_max = start[2];
+            } else {
+                for (int i = 0; i < nr_of_dpus; i++) {
+                    int64_t* start = (int64_t*)direct_buffer[i];
+                    size_sum += start[2];
+                    size_max = (size_max > start[2]) ? size_max : start[2];
                 }
-            };
-            get_size_sum(size_sum, size_max);
-            total_communication += size_sum;
-            total_actual_communication +=
-                (uint64_t)size_max * (uint64_t)nr_of_dpus;
-#ifdef PRINT_IO
-            printf("receive %d : sum=%d max=%d ratio=%lf\n", epoch_number,
-                   size_sum, size_max,
-                   ((double)size_sum / size_max) / nr_of_dpus);
-#endif
-        });
+            }
+        };
+        get_size_sum(size_sum, size_max);
+        total_communication += size_sum;
+        total_actual_communication += (uint64_t)size_max * (uint64_t)nr_of_dpus;
 #endif
 
         int64_t lengths[NR_DPUS];
@@ -989,6 +1000,14 @@ class IO_Manager {
                 tbs[i].supply_responce(bases, reply_length[i], reply_ct[i]);
             }
         });
+
+#if defined(INFO_IO_BALANCE) && defined(PRINT_IO)
+        auto receive_end_time = std::chrono::high_resolution_clock::now();
+        auto d = std::chrono::duration_cast<std::chrono::duration<double>>(receive_end_time - receive_start_time).count();
+        printf("receive %5d : sum=%5lfMB total=%5lfMB amplification=%8lf time=%5lf bandwidth=%5lfGB/s\n", epoch_number,
+                (double)size_sum / 1024 / 1024, (double)size_max * nr_of_dpus / 1024 / 1024,
+                (double)size_max * nr_of_dpus / size_sum, d, (double)size_max * nr_of_dpus / d / 1024 / 1024 / 1024);
+#endif
         io_manager_state = supplying_responces;
         return true;
     }
@@ -1022,8 +1041,7 @@ class IO_Manager {
                 while (!dpu_control::ready()) {
                     std::this_thread::sleep_for(std::chrono::microseconds(100));
                 }
-                // DPU_ASSERT(dpu_launch(dpu_set, DPU_ASYNCHRONOUS));
-                // DPU_ASSERT(dpu_sync(dpu_set));
+                time_nested("wait", [&]() { DPU_ASSERT(dpu_sync(dpu_set)); });
             });
             pim_coverage_timer->end();
             cpu_coverage_timer->start();
@@ -1041,31 +1059,35 @@ class IO_Manager {
         });
         return ret;
     }
-};
 
-const int NUM_IO_MANAGERS = 5;
-IO_Manager** io_managers;
+    const static size_t kNumIOManagers = 5;
+    static IO_Manager* io_managers[kNumIOManagers];
 
-inline void init_io_managers() {
-    io_managers = new IO_Manager*[NUM_IO_MANAGERS];
-    for (int i = 0; i < NUM_IO_MANAGERS; i++) {
-        io_managers[i] = new IO_Manager();
-        io_managers[i]->tid = worker_id();
-        io_managers[i]->id = i;
-        io_managers[i]->reset();
-    }
-}
-
-inline auto alloc_io_manager() {
-    unique_lock wLock(IO_Manager::alloc_io_manager_mutex);
-    for (int i = 0; i < NUM_IO_MANAGERS; i++) {
-        if (io_managers[i]->io_manager_state == idle) {
-            ASSERT(io_managers[i]->tid == (size_t)-1);
-            io_managers[i]->io_manager_state = pre_init;
-            io_managers[i]->tid = worker_id();
-            return io_managers[i];
+    static void init_io_managers() {
+        for (int i = 0; i < IO_Manager::kNumIOManagers; i++) {
+            IO_Manager::io_managers[i] = new IO_Manager();
+            IO_Manager::io_managers[i]->tid = worker_id();
+            IO_Manager::io_managers[i]->id = i;
+            IO_Manager::io_managers[i]->reset();
         }
     }
-    assert(false);
-    return io_managers[0];
-}
+
+    static IO_Manager* alloc_io_manager() {
+        unique_lock wLock(IO_Manager::alloc_io_manager_mutex);
+        for (int i = 0; i < IO_Manager::kNumIOManagers; i++) {
+            if (IO_Manager::io_managers[i]->io_manager_state == idle) {
+                ASSERT(IO_Manager::io_managers[i]->tid == (size_t)-1);
+                IO_Manager::io_managers[i]->io_manager_state = pre_init;
+                IO_Manager::io_managers[i]->tid = worker_id();
+                return IO_Manager::io_managers[i];
+            }
+        }
+        assert(false);
+        return nullptr;
+    }
+
+};
+
+std::mutex IO_Manager::alloc_io_manager_mutex;
+std::atomic<IO_Manager*> IO_Manager::working_manager;
+IO_Manager* IO_Manager::io_managers[IO_Manager::kNumIOManagers] = {nullptr, nullptr, nullptr, nullptr, nullptr};
